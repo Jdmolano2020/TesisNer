@@ -1,0 +1,11 @@
+{
+    "data_dir": ".\\Data\\sroie",
+    "output_dir": "./output",
+    "model_type": "both",
+    "technique": "combined",
+    "num_augmentations": 2,
+    "batch_size": 8,
+    "n_iter": 50,
+    "evaluate": false,
+    "use_gpu": false
+}

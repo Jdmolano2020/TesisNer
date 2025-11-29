@@ -1,0 +1,6 @@
+{
+    "company": "HASHA PETROKIOSK",
+    "date": "2018-04-06",
+    "address": "LOT PTD 198718 TMN SIERRA P 81750 MASAI JOHOR",
+    "total": "50.00"
+}

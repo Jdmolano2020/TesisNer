@@ -1,0 +1,11 @@
+2025-11-29 17:39:42,556 - __main__ - INFO - Entrenando modelo(s) con técnica: combined, aumentaciones: 2
+2025-11-29 17:39:42,558 - __main__ - INFO - Entrenando modelo DistilBERT...
+2025-11-29 17:39:42,559 - __main__ - ERROR - Error al ejecutar sroie_main: SROIEDistilBERTAugmenter.load_data() takes 1 positional argument but 2 were given
+Traceback (most recent call last):
+  File "C:\Users\HP\Documents\Tesis\Programas\main\Version 2.0\sroie_main.py", line 219, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\HP\Documents\Tesis\Programas\main\Version 2.0\sroie_main.py", line 163, in main
+    train_texts, train_tags = distilbert_augmenter.load_data(args.data_dir)
+                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+TypeError: SROIEDistilBERTAugmenter.load_data() takes 1 positional argument but 2 were given
