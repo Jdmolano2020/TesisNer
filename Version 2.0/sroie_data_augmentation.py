@@ -111,12 +111,17 @@ class SROIEDataAugmenter:
         
         tokenizer = self.translation_models[model_key]['tokenizer']
         model = self.translation_models[model_key]['model']
-        
-        # Tokenizar y traducir
-        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
+
+        # Determinar longitud máxima soportada por el tokenizer/modelo
+        max_len = getattr(tokenizer, 'model_max_length', None) or 512
+
+        # Tokenizar con truncamiento seguro al máximo del modelo
+        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=max_len).to(self.device)
+
+        # Generación (si el input fue truncado, queda en el límite del modelo)
         outputs = model.generate(**inputs)
         translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
+
         return translated_text
     
     def back_translate(self, text: str, entities: Entities, 
@@ -150,6 +155,16 @@ class SROIEDataAugmenter:
             entity_map[mask] = (entity_text, start, end, entity_type)
         
         # 2. Traducir al idioma objetivo
+        # Antes de traducir, comprobar que la secuencia no exceda el máximo
+        tokenizer_src_tgt = self.translation_models[f'{source_lang}-{target_lang}']['tokenizer']
+        max_len = getattr(tokenizer_src_tgt, 'model_max_length', None) or 512
+
+        # Revisar número de tokens; si es demasiado largo, evitamos back-translation
+        tokenized_len = len(tokenizer_src_tgt.encode(masked_text, add_special_tokens=True))
+        if tokenized_len > max_len:
+            logger.warning("Texto demasiado largo para back_translation (tokens=%d, max=%d). Se omite BT.", tokenized_len, max_len)
+            return text, entities
+
         translated_text = self.translate(masked_text, source_lang, target_lang)
         
         # 3. Traducir de vuelta al idioma original
@@ -303,28 +318,40 @@ class SROIEDataAugmenter:
             if not is_entity and random.random() < replacement_prob:
                 # Crear una copia del texto con el token enmascarado
                 masked_text = ' '.join(tokens[:i] + ['[MASK]'] + tokens[i+1:])
-                
-                # Tokenizar para BERT
-                inputs = self.bert_tokenizer(masked_text, return_tensors="pt").to(self.device)
-                
+
+                # Comprobar longitud de la secuencia para BERT
+                bert_max_len = getattr(self.bert_tokenizer, 'model_max_length', None) or 512
+                try:
+                    tokenized_len = len(self.bert_tokenizer.encode(masked_text, add_special_tokens=True))
+                except Exception:
+                    tokenized_len = 0
+
+                # Si excede el máximo, saltamos este token para evitar errores
+                if tokenized_len == 0 or tokenized_len > bert_max_len:
+                    logger.debug("Omitiendo reemplazo CWR para token '%s' (tokens=%d, max=%d)", token, tokenized_len, bert_max_len)
+                    continue
+
+                # Tokenizar para BERT con truncamiento seguro
+                inputs = self.bert_tokenizer(masked_text, return_tensors="pt", truncation=True, max_length=bert_max_len).to(self.device)
+
                 # Obtener predicciones
                 with torch.no_grad():
                     outputs = self.bert_model(**inputs)
                     predictions = outputs.logits
-                
+
                 # Encontrar el índice del token [MASK]
                 mask_token_index = (inputs.input_ids == self.bert_tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
-                
+
                 if len(mask_token_index) > 0:
                     mask_idx = mask_token_index[0].item()
-                    
+
                     # Obtener las top_k mejores predicciones
                     top_k_indices = torch.topk(predictions[0, mask_idx], top_k).indices.tolist()
-                    
+
                     # Seleccionar un reemplazo aleatorio entre las mejores predicciones
                     replacement_id = random.choice(top_k_indices)
                     replacement = self.bert_tokenizer.decode([replacement_id]).strip()
-                    
+
                     # Reemplazar el token
                     new_tokens[i] = replacement
         
