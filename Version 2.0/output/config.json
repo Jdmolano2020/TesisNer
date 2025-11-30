@@ -1,5 +1,5 @@
 {
-    "data_dir": ".\\Data\\sroie",
+    "data_dir": ".\\Data\\sroie\\train",
     "output_dir": "./output",
     "model_type": "both",
     "technique": "combined",
