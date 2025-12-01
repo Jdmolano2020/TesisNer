@@ -19,6 +19,44 @@ from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Tuple, Dict, Any, Optional
 from logging_config import get_logger
 from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Variable global que usarán los workers para evitar recrear objetos en cada tarea
+WORKER_AUGMENTER = None
+
+
+def _worker_init(techniques_to_load: Optional[list] = None, use_gpu: bool = False):
+    """
+    Inicializador para cada proceso del Pool. Crea una instancia de
+    SROIEDataAugmenter por worker y precarga solo los modelos necesarios.
+
+    Args:
+        techniques_to_load: Lista de técnicas (strings) que indicarán qué modelos
+            deben precargarse (por ejemplo 'back_translation' o 'cwr').
+        use_gpu: Si se debe usar GPU en el worker (por defecto False para evitar
+            conflictos en máquinas sin GPU o para evitar gran uso de memoria GPU).
+    """
+    global WORKER_AUGMENTER
+    try:
+        WORKER_AUGMENTER = SROIEDataAugmenter(use_gpu=use_gpu)
+
+        # Precargar solo los modelos necesarios para ahorrar memoria/tiempo
+        techniques = set(techniques_to_load or [])
+        if any(t.startswith('back_translation') or 'back_translation' in t for t in techniques):
+            try:
+                WORKER_AUGMENTER.load_translation_models()
+            except Exception:
+                # Si falla la carga en el worker, dejaremos que el worker intente
+                # cargarlos bajo demanda; ya predescargamos en el proceso padre.
+                pass
+
+        if any('cwr' in t for t in techniques):
+            try:
+                WORKER_AUGMENTER.load_bert_model()
+            except Exception:
+                pass
+    except Exception:
+        WORKER_AUGMENTER = None
 
 logger = get_logger(__name__)
 
@@ -436,10 +474,11 @@ class SROIEDataAugmenter:
             raise ValueError(f"Técnica desconocida: {technique}")
     
     def generate_synthetic_data(self, texts: List[str], all_entities: List[Entities],
-                               techniques: List[str] = None,
-                               num_augmentations: int = 2,
-                               use_parallel: bool = False,
-                               num_workers: int = 4) -> Tuple[List[str], List[Entities]]:
+                                   techniques: List[str] = None,
+                                   num_augmentations: int = 2,
+                                   use_parallel: bool = False,
+                                   use_threads: bool = False,
+                                   num_workers: int = 4) -> Tuple[List[str], List[Entities]]:
         """
         Genera datos sintéticos aplicando técnicas de aumentación.
         
@@ -468,26 +507,97 @@ class SROIEDataAugmenter:
         if use_parallel:
             # Paralelizar con multiprocessing
             from multiprocessing import Pool
-            
+
             # Crear lista de tareas: (texto, entidades, entity_pool, technique_choice, índice)
             tasks = []
+            chosen_techniques = set()
             for i, (text, entities) in enumerate(zip(texts, all_entities)):
                 for j in range(num_augmentations):
                     technique = random.choice(techniques)
                     tasks.append((text, entities, entity_pool, technique, i, j))
-            
+                    chosen_techniques.add(technique)
+
             logger.info("Iniciando paralelización con %d workers para %d tareas...", num_workers, len(tasks))
-            
-            # Procesar en paralelo
-            with Pool(num_workers) as pool:
-                results = pool.starmap(_worker_augment, tasks)
-            
-            # Separar resultados
-            for aug_text, aug_entities, task_idx in results:
-                synthetic_texts.append(aug_text)
-                synthetic_entities.append(aug_entities)
-            
-            logger.info("Paralelización completada. Generados %d textos sintéticos.", len(synthetic_texts))
+
+            # Predescargar modelos en el proceso principal para evitar descargas simultáneas
+            try:
+                main_augmenter = SROIEDataAugmenter(use_gpu=False)
+                if any(t.startswith('back_translation') or 'back_translation' in t for t in chosen_techniques):
+                    main_augmenter.load_translation_models()
+                if any('cwr' in t for t in chosen_techniques):
+                    main_augmenter.load_bert_model()
+            except Exception as e:
+                logger.warning("No se pudieron predescargar todos los modelos en el proceso principal: %s", e)
+
+            # Si se prefieren threads (comparten memoria/modelos), usar ThreadPoolExecutor.
+            def _thread_worker_augment(shared_augmenter: SROIEDataAugmenter, text: str, entities: Entities, entity_pool: Dict[str, List[str]], technique: str, task_idx: int, sub_idx: int):
+                try:
+                    aug_text, aug_entities = shared_augmenter.apply_combined_augmentation(
+                        text, entities, entity_pool, technique
+                    )
+                    return aug_text, aug_entities, task_idx
+                except Exception as e:
+                    logger.error("Error en thread worker para tarea %d.%d: %s", task_idx, sub_idx, e)
+                    return text, entities, task_idx
+
+            # Iniciar Pool pasando las técnicas necesarias al inicializador si usamos procesos.
+            try:
+                if use_threads:
+                    # Compartir la misma instancia de augmenter entre hilos
+                    main_augmenter = SROIEDataAugmenter(use_gpu=False)
+                    if any(t.startswith('back_translation') or 'back_translation' in t for t in chosen_techniques):
+                        main_augmenter.load_translation_models()
+                    if any('cwr' in t for t in chosen_techniques):
+                        main_augmenter.load_bert_model()
+
+                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                        futures = [executor.submit(_thread_worker_augment, main_augmenter, text, entities, entity_pool, technique, i, j)
+                                   for (text, entities, entity_pool, technique, i, j) in tasks]
+
+                        for fut in as_completed(futures):
+                            aug_text, aug_entities, task_idx = fut.result()
+                            synthetic_texts.append(aug_text)
+                            synthetic_entities.append(aug_entities)
+
+                    logger.info("Paralelización con threads completada. Generados %d textos sintéticos.", len(synthetic_texts))
+                else:
+                    with Pool(processes=num_workers, initializer=_worker_init, initargs=(list(chosen_techniques), False)) as pool:
+                        results = pool.starmap(_worker_augment, tasks)
+
+                    # Separar resultados
+                    for aug_text, aug_entities, task_idx in results:
+                        synthetic_texts.append(aug_text)
+                        synthetic_entities.append(aug_entities)
+
+                    logger.info("Paralelización con procesos completada. Generados %d textos sintéticos.", len(synthetic_texts))
+
+            except (MemoryError, RuntimeError, torch.cuda.CudaError) as e:
+                # Si ocurre un error de asignación de memoria u otro problema relacionado,
+                # hacer fallback a ejecución secuencial reduciendo uso de memoria.
+                logger.error("Paralelización fallida por error: %s. Reintentando de forma secuencial.", e)
+                # Reintentar secuencialmente
+                for i, (text, entities) in enumerate(zip(texts, all_entities)):
+                    logger.info("Generando datos sintéticos (secuencial) para texto %d/%d...", i+1, len(texts))
+                    for j in range(num_augmentations):
+                        technique = random.choice(techniques)
+                        aug_text, aug_entities = self.apply_combined_augmentation(
+                            text, entities, entity_pool, technique
+                        )
+                        synthetic_texts.append(aug_text)
+                        synthetic_entities.append(aug_entities)
+
+            except Exception as e:
+                # Capturar otros errores y hacer fallback
+                logger.exception("Error inesperado al paralelizar: %s. Reintentando de forma secuencial.", e)
+                for i, (text, entities) in enumerate(zip(texts, all_entities)):
+                    logger.info("Generando datos sintéticos (secuencial) para texto %d/%d...", i+1, len(texts))
+                    for j in range(num_augmentations):
+                        technique = random.choice(techniques)
+                        aug_text, aug_entities = self.apply_combined_augmentation(
+                            text, entities, entity_pool, technique
+                        )
+                        synthetic_texts.append(aug_text)
+                        synthetic_entities.append(aug_entities)
         else:
             # Versión secuencial (original)
             for i, (text, entities) in enumerate(zip(texts, all_entities)):
@@ -640,14 +750,18 @@ def _worker_augment(text: str, entities: Entities, entity_pool: Dict[str, List[s
         Tuple (texto_aumentado, entidades_aumentadas, task_idx).
     """
     try:
-        # Crear augmenter local (sin GPU para evitar conflictos)
-        augmenter = SROIEDataAugmenter(use_gpu=False)
-        
+        # Reutilizar el augmenter creado por _worker_init si existe
+        global WORKER_AUGMENTER
+        if WORKER_AUGMENTER is None:
+            augmenter = SROIEDataAugmenter(use_gpu=False)
+        else:
+            augmenter = WORKER_AUGMENTER
+
         # Aplicar técnica
         aug_text, aug_entities = augmenter.apply_combined_augmentation(
             text, entities, entity_pool, technique
         )
-        
+
         return aug_text, aug_entities, task_idx
     except Exception as e:
         logger.error("Error en worker para tarea %d.%d: %s", task_idx, sub_idx, e)

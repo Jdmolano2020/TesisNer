@@ -387,7 +387,8 @@ class SROIEDistilBERTAugmenter:
         
         # Generar datos sintéticos
         synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
-            texts, all_entities, num_augmentations=num_augmentations,use_parallel=True, num_workers=7
+            texts, all_entities, num_augmentations=num_augmentations,
+            use_parallel=True,use_threads=True, num_workers=6
         )
         
         # Filtrar datos sintéticos de baja calidad
