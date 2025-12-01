@@ -387,7 +387,7 @@ class SROIEDistilBERTAugmenter:
         
         # Generar datos sintéticos
         synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
-            texts, all_entities, num_augmentations=num_augmentations
+            texts, all_entities, num_augmentations=num_augmentations,use_parallel=True, num_workers=7
         )
         
         # Filtrar datos sintéticos de baja calidad
@@ -468,12 +468,15 @@ class SROIEDistilBERTAugmenter:
         if use_class_weights:
             # Aplanar todas las etiquetas
             all_labels = [tag for doc_tags in train_tags for tag in doc_tags]
-            unique_labels = list(set(all_labels))
-            
-            # Calcular pesos de clase
+            # compute_class_weight requiere que 'classes' sea un numpy.ndarray
+            unique_labels = np.array(list(set(all_labels)), dtype=object)
+
+            # Calcular pesos de clase (devuelve pesos en el mismo orden que 'unique_labels')
             class_weights = compute_class_weight('balanced', classes=unique_labels, y=all_labels)
+
+            # Mapear label -> peso y luego a id de etiqueta
             class_weight_dict = {train_dataset.tag2id[label]: weight 
-                               for label, weight in zip(unique_labels, class_weights)}
+                                 for label, weight in zip(unique_labels.tolist(), class_weights)}
             
             # Convertir a tensor para PyTorch
             weights = torch.FloatTensor([class_weight_dict.get(i, 1.0) 

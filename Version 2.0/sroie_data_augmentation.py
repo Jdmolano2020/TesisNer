@@ -18,6 +18,7 @@ from transformers import MarianMTModel, MarianTokenizer, BertTokenizer, BertForM
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Tuple, Dict, Any, Optional
 from logging_config import get_logger
+from multiprocessing import Pool
 
 logger = get_logger(__name__)
 
@@ -213,7 +214,7 @@ class SROIEDataAugmenter:
                  entity_pool: Dict[str, List[str]], 
                  replacement_prob: float = 0.5) -> Tuple[str, Entities]:
         """
-        Implementa Targeted Entity Random Replacement (TER).
+        Implementa Targeted Entity Random Replacement (TER) - OPTIMIZADA.
         
         Args:
             text: Texto original.
@@ -224,6 +225,10 @@ class SROIEDataAugmenter:
         Returns:
             Tuple con el texto modificado y las entidades actualizadas.
         """
+        # OPTIMIZACIÓN: si no hay entidades o pool vacío, devolver original
+        if not entities or not entity_pool:
+            return text, entities
+        
         # Crear copia del texto y entidades
         new_text = text
         new_entities = []
@@ -235,33 +240,28 @@ class SROIEDataAugmenter:
         offset = 0
         
         for entity_text, start, end, entity_type in sorted_entities:
-            if (entity_type in entity_pool and 
-                len(entity_pool[entity_type]) > 1 and 
-                random.random() < replacement_prob):
-                
-                # Seleccionar una entidad diferente del mismo tipo
+            # OPTIMIZACIÓN: pre-computar lista de reemplazos válidos
+            if entity_type in entity_pool:
                 replacements = [e for e in entity_pool[entity_type] if e != entity_text]
-                if replacements:
-                    replacement = random.choice(replacements)
-                    
-                    # Ajustar posiciones con el offset acumulado
-                    adjusted_start = start + offset
-                    adjusted_end = end + offset
-                    
-                    # Reemplazar en el texto
-                    new_text = new_text[:adjusted_start] + replacement + new_text[adjusted_end:]
-                    
-                    # Calcular nuevo offset
-                    length_diff = len(replacement) - len(entity_text)
-                    offset += length_diff
-                    
-                    # Agregar la nueva entidad
-                    new_entities.append((replacement, adjusted_start, adjusted_start + len(replacement), entity_type))
-                else:
-                    # Si no hay reemplazos disponibles, mantener la entidad original
-                    adjusted_start = start + offset
-                    adjusted_end = end + offset
-                    new_entities.append((entity_text, adjusted_start, adjusted_end, entity_type))
+            else:
+                replacements = []
+            
+            if replacements and random.random() < replacement_prob:
+                replacement = random.choice(replacements)
+                
+                # Ajustar posiciones con el offset acumulado
+                adjusted_start = start + offset
+                adjusted_end = end + offset
+                
+                # Reemplazar en el texto
+                new_text = new_text[:adjusted_start] + replacement + new_text[adjusted_end:]
+                
+                # Calcular nuevo offset
+                length_diff = len(replacement) - len(entity_text)
+                offset += length_diff
+                
+                # Agregar la nueva entidad
+                new_entities.append((replacement, adjusted_start, adjusted_start + len(replacement), entity_type))
             else:
                 # Mantener la entidad original, pero ajustar posiciones
                 adjusted_start = start + offset
@@ -437,7 +437,9 @@ class SROIEDataAugmenter:
     
     def generate_synthetic_data(self, texts: List[str], all_entities: List[Entities],
                                techniques: List[str] = None,
-                               num_augmentations: int = 2) -> Tuple[List[str], List[Entities]]:
+                               num_augmentations: int = 2,
+                               use_parallel: bool = False,
+                               num_workers: int = 4) -> Tuple[List[str], List[Entities]]:
         """
         Genera datos sintéticos aplicando técnicas de aumentación.
         
@@ -446,34 +448,62 @@ class SROIEDataAugmenter:
             all_entities: Lista de listas de entidades para cada texto.
             techniques: Lista de técnicas a aplicar. Si es None, se seleccionan aleatoriamente.
             num_augmentations: Número de versiones aumentadas a generar por texto.
+            use_parallel: Si se debe usar multiprocessing para paralelizar.
+            num_workers: Número de procesos paralelos (si use_parallel=True).
             
         Returns:
             Tuple con listas de textos y entidades aumentados.
         """
         if techniques is None:
+            # Usar todas las técnicas disponibles (incluyendo back_translation)
             techniques = ["back_translation", "ter", "cwr", 
                          "back_translation+ter", "back_translation+cwr"]
         
-        # Construir pool de entidades
+        # Construir pool de entidades una sola vez
         entity_pool = self.build_entity_pool(texts, all_entities)
         
         synthetic_texts = []
         synthetic_entities = []
         
-        for i, (text, entities) in enumerate(zip(texts, all_entities)):
-            logger.info("Generando datos sintéticos para texto %d/%d...", i+1, len(texts))
+        if use_parallel:
+            # Paralelizar con multiprocessing
+            from multiprocessing import Pool
             
-            for j in range(num_augmentations):
-                # Seleccionar técnica
-                technique = random.choice(techniques)
-                
-                # Aplicar técnica
-                aug_text, aug_entities = self.apply_combined_augmentation(
-                    text, entities, entity_pool, technique
-                )
-                
+            # Crear lista de tareas: (texto, entidades, entity_pool, technique_choice, índice)
+            tasks = []
+            for i, (text, entities) in enumerate(zip(texts, all_entities)):
+                for j in range(num_augmentations):
+                    technique = random.choice(techniques)
+                    tasks.append((text, entities, entity_pool, technique, i, j))
+            
+            logger.info("Iniciando paralelización con %d workers para %d tareas...", num_workers, len(tasks))
+            
+            # Procesar en paralelo
+            with Pool(num_workers) as pool:
+                results = pool.starmap(_worker_augment, tasks)
+            
+            # Separar resultados
+            for aug_text, aug_entities, task_idx in results:
                 synthetic_texts.append(aug_text)
                 synthetic_entities.append(aug_entities)
+            
+            logger.info("Paralelización completada. Generados %d textos sintéticos.", len(synthetic_texts))
+        else:
+            # Versión secuencial (original)
+            for i, (text, entities) in enumerate(zip(texts, all_entities)):
+                logger.info("Generando datos sintéticos para texto %d/%d...", i+1, len(texts))
+                
+                for j in range(num_augmentations):
+                    # Seleccionar técnica
+                    technique = random.choice(techniques)
+                    
+                    # Aplicar técnica
+                    aug_text, aug_entities = self.apply_combined_augmentation(
+                        text, entities, entity_pool, technique
+                    )
+                    
+                    synthetic_texts.append(aug_text)
+                    synthetic_entities.append(aug_entities)
         
         return synthetic_texts, synthetic_entities
     
@@ -592,6 +622,39 @@ class SROIEDataAugmenter:
         return filtered_texts, filtered_entities
 
 
+def _worker_augment(text: str, entities: Entities, entity_pool: Dict[str, List[str]], 
+                   technique: str, task_idx: int, sub_idx: int) -> Tuple[str, Entities, int]:
+    """
+    Worker function para paralelización con multiprocessing.
+    Crea una instancia local del aumentador sin GPU.
+    
+    Args:
+        text: Texto a aumentar.
+        entities: Entidades del texto.
+        entity_pool: Pool de entidades compartido.
+        technique: Técnica a usar.
+        task_idx: Índice de la tarea (para logging).
+        sub_idx: Sub-índice dentro de la tarea.
+    
+    Returns:
+        Tuple (texto_aumentado, entidades_aumentadas, task_idx).
+    """
+    try:
+        # Crear augmenter local (sin GPU para evitar conflictos)
+        augmenter = SROIEDataAugmenter(use_gpu=False)
+        
+        # Aplicar técnica
+        aug_text, aug_entities = augmenter.apply_combined_augmentation(
+            text, entities, entity_pool, technique
+        )
+        
+        return aug_text, aug_entities, task_idx
+    except Exception as e:
+        logger.error("Error en worker para tarea %d.%d: %s", task_idx, sub_idx, e)
+        # En caso de error, devolver el texto original
+        return text, entities, task_idx
+
+
 # Ejemplo de uso
 if __name__ == "__main__":
     # Datos de ejemplo
@@ -616,10 +679,21 @@ if __name__ == "__main__":
     # Crear aumentador de datos
     augmenter = SROIEDataAugmenter(use_gpu=False)
     
-    # Generar datos sintéticos
+    # Generar datos sintéticos (AHORA CON PARALELIZACIÓN)
+    # use_parallel=True activa multiprocessing para acelerar
+    # num_workers: ajustar según CPU disponible (ej: 4, 8, etc.)
+    import time
+    inicio = time.time()
+    
     synthetic_texts, synthetic_entities = augmenter.generate_synthetic_data(
-        texts, entities, num_augmentations=2
+        texts, entities, 
+        num_augmentations=2,
+        use_parallel=True,  # PARALELIZACIÓN ACTIVADA
+        num_workers=4       # Ajustar según CPU
     )
+    
+    tiempo = time.time() - inicio
+    logger.info("Tiempo total: %.2f segundos", tiempo)
     
     # Evaluar calidad
     quality = augmenter.evaluate_synthetic_data_quality(
