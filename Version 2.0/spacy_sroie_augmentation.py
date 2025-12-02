@@ -27,6 +27,20 @@ logger = get_logger(__name__)
 random.seed(42)
 np.random.seed(42)
 
+def parse(line):
+    fields = line.strip().split(",")
+    if len(fields) == 9:
+        return fields
+    else:
+        return fields[:8] + [",".join(fields[8:])]
+
+
+def build_text(data):
+    text = " ".join(data.text)
+    text = text.replace("  "," ")
+    return text
+
+
 class SROIESpacyAugmenter:
     """Clase para integrar aumentación de datos en la solución spaCy para SROIE."""
     
@@ -88,17 +102,22 @@ class SROIESpacyAugmenter:
         # Implementar la carga de datos según el formato específico de SROIE
         # Esta es una implementación genérica que debe adaptarse al formato real
         
-        # Ejemplo de carga de datos (adaptar según el formato real)
-        text_files = [f for f in os.listdir(data_dir) if f.endswith('.txt')]
+        # Carga de datos
+        
+        data_dir_texto = data_dir+"\\box"
+        data_dir_tag = data_dir+"\\entities"
+        text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
+        text_files = text_files[:10] #para realizar pruebas con pocos archivos
+
         for text_file in text_files:
             # Cargar texto
-            with open(os.path.join(data_dir, text_file), 'r', encoding='utf-8') as f:
+            with open(os.path.join(data_dir_texto, text_file), 'r', encoding='utf-8') as f:
                 text = f.read().strip()
             
-            # Cargar anotaciones (adaptar según el formato real)
-            tag_file = text_file.replace('.txt', '.json')
-            if os.path.exists(os.path.join(data_dir, tag_file)):
-                with open(os.path.join(data_dir, tag_file), 'r', encoding='utf-8') as f:
+            # Cargar etiquetas correspondientes
+            tag_file = text_file
+            if os.path.exists(os.path.join(data_dir_tag, tag_file)):
+                with open(os.path.join(data_dir_tag, tag_file), 'r', encoding='utf-8') as f:
                     annotations = json.load(f)
                 
                 # Convertir anotaciones al formato de spaCy

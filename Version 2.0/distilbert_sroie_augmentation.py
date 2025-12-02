@@ -254,10 +254,11 @@ class SROIEDistilBERTAugmenter:
         # Implementar la carga de datos según el formato específico de SROIE
         # Esta es una implementación genérica que debe adaptarse al formato real
         
-        # Ejemplo de carga de datos (adaptar según el formato real)
+        # Carga de datos
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
         text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
+        text_files = text_files[:10] #para realizar pruebas con pocos archivos
         for text_file in text_files:
             # Cargar texto
             with open(os.path.join(data_dir_texto, text_file), 'r', encoding='utf-8', errors='ignore') as f:
@@ -267,7 +268,7 @@ class SROIEDistilBERTAugmenter:
             #print("data",data)
             texto = build_text(data)
             
-            # Cargar etiquetas (adaptar según el formato real)
+            # Cargar etiquetas correspondientes
             tag_file = text_file
             if os.path.exists(os.path.join(data_dir_tag, tag_file)):
                 with open(os.path.join(data_dir_tag, tag_file), 'r', encoding='utf-8') as f:
@@ -469,8 +470,8 @@ class SROIEDistilBERTAugmenter:
         if use_class_weights:
             # Aplanar todas las etiquetas
             all_labels = [tag for doc_tags in train_tags for tag in doc_tags]
-            # compute_class_weight requiere que 'classes' sea un numpy.ndarray
-            unique_labels = np.array(list(set(all_labels)), dtype=object)
+            # Obtener etiquetas únicas como numpy.ndarray (requerido por sklearn)
+            unique_labels = np.unique(all_labels)
 
             # Calcular pesos de clase (devuelve pesos en el mismo orden que 'unique_labels')
             class_weights = compute_class_weight('balanced', classes=unique_labels, y=all_labels)
