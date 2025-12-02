@@ -38,6 +38,7 @@ def parse(line):
 def build_text(data):
     text = " ".join(data.text)
     text = text.replace("  "," ")
+    
     return text
 
 
@@ -99,7 +100,7 @@ class SROIESpacyAugmenter:
             Lista de tuplas (texto, anotaciones) en formato spaCy.
         """
         spacy_data = []
-        
+        # Carga de datos
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
         text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
@@ -120,6 +121,18 @@ class SROIESpacyAugmenter:
                 entities = []
                 for entity_type, values in annotations.items():
                     for value in values:
+                        if len(value)==0:
+                            continue
+                        else:
+                            value=value.translate(str.maketrans({"-":  r"\-",
+                                                                        "]":  r"\]",
+                                                                        "\\": r"\\",
+                                                                        "^":  r"\^",
+                                                                        "$":  r"\$",
+                                                                        "*":  r"\*",
+                                                                        ".":  r"\.",
+                                                                        "(":  r"\(",
+                                                                        ")":  r"\)" }))
                         # Buscar la posición de la entidad en el texto
                         start = text.find(value)
                         if start != -1:
@@ -674,8 +687,9 @@ class SROIESpacyAugmenter:
             return doc
         
         # Agregar componente de post-procesamiento al pipeline
+        # Pasamos la función directamente para evitar objetos no serializables
         if "post_process" not in self.nlp.pipe_names:
-            self.nlp.add_pipe("post_process", after="ner", config={"func": post_process_predictions})
+            self.nlp.add_pipe(post_process_predictions, name="post_process", after="ner")
     
     def predict(self, texts: List[str]) -> List[List[Tuple[str, int, int, str]]]:
         """
