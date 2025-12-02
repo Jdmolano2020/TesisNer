@@ -90,6 +90,7 @@ class SROIESpacyAugmenter:
     def load_data(self, data_dir: str) -> List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]]:
         """
         Carga los datos del dataset SROIE en formato para spaCy.
+        Valida y limpia alineaciones de entidades.
         
         Args:
             data_dir: Directorio con los archivos del dataset.
@@ -98,11 +99,6 @@ class SROIESpacyAugmenter:
             Lista de tuplas (texto, anotaciones) en formato spaCy.
         """
         spacy_data = []
-        
-        # Implementar la carga de datos según el formato específico de SROIE
-        # Esta es una implementación genérica que debe adaptarse al formato real
-        
-        # Carga de datos
         
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
@@ -130,7 +126,13 @@ class SROIESpacyAugmenter:
                             end = start + len(value)
                             entities.append((start, end, entity_type))
                 
-                spacy_data.append((text, {"entities": entities}))
+                # Validar y fijar alineación de entidades antes de agregar
+                cleaned_text, valid_entities = self._validate_and_fix_alignment(text, entities)
+                
+                if valid_entities:
+                    spacy_data.append((cleaned_text, {"entities": valid_entities}))
+                else:
+                    logger.warning("Archivo %s no tiene entidades válidas tras limpieza", text_file)
         
         return spacy_data
     
@@ -349,6 +351,124 @@ class SROIESpacyAugmenter:
         self.nlp.to_disk(os.path.join(model_dir, "final_model"))
         
         return metrics
+
+    def _clean_entities(self, entities: List[Tuple[int, int, str]], text_len: Optional[int] = None) -> List[Tuple[int, int, str]]:
+        """
+        Limpia la lista de entidades eliminando duplicados exactos y resolviendo
+        solapamientos. Se prefiere spans más largos cuando hay solapamiento.
+
+        Args:
+            entities: Lista de tuplas (start, end, label).
+            text_len: Longitud del texto para validar límites (opcional).
+
+        Returns:
+            Lista filtrada de tuplas (start, end, label) sin solapamientos.
+        """
+        if not entities:
+            return []
+
+        # Filtrar spans inválidos y normalizar
+        cleaned = []
+        for start, end, label in entities:
+            if start is None or end is None:
+                continue
+            if start < 0 or end <= start:
+                continue
+            if text_len is not None and end > text_len:
+                continue
+            cleaned.append((start, end, label))
+
+        # Eliminar duplicados exactos (mismo start,end,label)
+        unique = list(dict.fromkeys(cleaned))
+
+        # Ordenar por start asc y length desc para preferir spans más largos
+        unique.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+        result = []
+        occupied = []  # lista de (start,end) ya ocupados
+        for start, end, label in unique:
+            overlap = False
+            for ostart, oend in occupied:
+                # comprobar solapamiento
+                if not (end <= ostart or start >= oend):
+                    overlap = True
+                    break
+            if not overlap:
+                result.append((start, end, label))
+                occupied.append((start, end))
+
+        if len(result) != len(entities):
+            logger.debug("_clean_entities: reducidas %d -> %d entidades por duplicados/solapamientos", len(entities), len(result))
+
+        return result
+
+    def _validate_and_fix_alignment(self, text: str, entities: List[Tuple[int, int, str]]) -> Tuple[str, List[Tuple[int, int, str]]]:
+        """
+        Valida la alineación de entidades con el texto y corrige posiciones si es necesario.
+        Limpia espacios en blanco y caracteres problemáticos del texto.
+
+        Args:
+            text: Texto original.
+            entities: Lista de tuplas (start, end, label).
+
+        Returns:
+            Tuple con (texto_limpiado, entidades_validadas).
+        """
+        # Normalizar espacios múltiples y saltos de línea
+        cleaned_text = re.sub(r'\s+', ' ', text).strip()
+
+        # Validar y corregir cada entidad
+        valid_entities = []
+        removed_count = 0
+
+        for start, end, label in entities:
+            if start is None or end is None or label is None:
+                removed_count += 1
+                continue
+
+            if start < 0 or end > len(text) or start >= end:
+                logger.warning("Entidad inválida (fuera de rango): start=%d, end=%d, len(text)=%d, label=%s", start, end, len(text), label)
+                removed_count += 1
+                continue
+
+            try:
+                entity_text = text[start:end].strip()
+
+                if not entity_text:
+                    logger.debug("Omitiendo entidad vacía: label=%s", label)
+                    removed_count += 1
+                    continue
+
+                # Buscar la entidad en el texto limpiado (tolerancia a espacios)
+                found_pos = cleaned_text.find(entity_text)
+                if found_pos == -1:
+                    # Si no se encuentra exactamente, intentar buscar sin caracteres especiales
+                    entity_normalized = re.sub(r'\s+', ' ', entity_text)
+                    found_pos = cleaned_text.find(entity_normalized)
+
+                if found_pos == -1:
+                    logger.debug("No se pudo alinear entidad '%s' (label=%s) en el texto limpiado", entity_text[:50], label)
+                    removed_count += 1
+                    continue
+
+                # Usar las nuevas posiciones
+                new_start = found_pos
+                new_end = found_pos + len(entity_text)
+
+                # Verificar validez final
+                if new_start >= 0 and new_end <= len(cleaned_text):
+                    valid_entities.append((new_start, new_end, label))
+                else:
+                    removed_count += 1
+
+            except Exception as e:
+                logger.debug("Error al procesar entidad: %s", e)
+                removed_count += 1
+
+        if removed_count > 0:
+            logger.debug("_validate_and_fix_alignment: removidas %d/%d entidades por alineación", removed_count, len(entities))
+
+        return cleaned_text, valid_entities
     
     def _train_fold(self, nlp, train_data, val_data, n_iter, batch_size, dropout):
         """
@@ -397,9 +517,22 @@ class SROIESpacyAugmenter:
                 # Convertir a ejemplos de spaCy
                 examples = []
                 for text, annotations in batch:
-                    doc = nlp.make_doc(text)
-                    example = Example.from_dict(doc, annotations)
-                    examples.append(example)
+                    # Primero validar y fijar alineación
+                    cleaned_text, aligned_entities = self._validate_and_fix_alignment(text, annotations.get("entities", []))
+                    
+                    # Luego limpiar duplicados/solapamientos
+                    final_entities = self._clean_entities(aligned_entities, text_len=len(cleaned_text))
+                    
+                    # Crear doc con el texto limpiado
+                    doc = nlp.make_doc(cleaned_text)
+                    cleaned_annotations = {"entities": final_entities}
+                    
+                    try:
+                        example = Example.from_dict(doc, cleaned_annotations)
+                        examples.append(example)
+                    except Exception as e:
+                        logger.warning("No se pudo crear Example para texto: %s", e)
+                        continue
                 
                 # Actualizar modelo
                 nlp.update(examples, drop=dropout, losses=losses)
