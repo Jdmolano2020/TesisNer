@@ -10,6 +10,7 @@ import random
 import numpy as np
 import spacy
 from spacy.training import Example
+from spacy.language import Language
 from spacy.util import minibatch, compounding
 from spacy.pipeline import EntityRuler
 from sklearn.model_selection import KFold
@@ -22,6 +23,54 @@ from sroie_data_augmentation import SROIEDataAugmenter, Entity, Entities
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+@Language.component("sroie_post_process")
+def sroie_post_process(doc):
+    """
+    Componente spaCy registrado para post-procesamiento de entidades.
+    Aplica reglas simples para corregir fechas y totales.
+    """
+    new_ents = []
+
+    for ent in doc.ents:
+        # Regla 1: Corregir fechas mal formateadas
+        if ent.label_ == "DATE":
+            if re.match(r'\d{2}/\d{2}/\d{4}', ent.text) or re.match(r'\d{2}-\d{2}-\d{4}', ent.text):
+                new_ents.append(ent)
+            else:
+                context = doc.text[max(0, ent.start_char - 20):min(len(doc.text), ent.end_char + 20)]
+                date_match = re.search(r'\d{2}[/-]\d{2}[/-]\d{4}', context)
+                if date_match:
+                    start = doc.text.find(date_match.group(0))
+                    end = start + len(date_match.group(0))
+                    span = doc.char_span(start, end, label="DATE")
+                    if span:
+                        new_ents.append(span)
+                else:
+                    new_ents.append(ent)
+
+        # Regla 2: Verificar totales con formato incorrecto
+        elif ent.label_ == "TOTAL":
+            if re.match(r'\$?\d+\.\d+', ent.text):
+                new_ents.append(ent)
+            else:
+                context = doc.text[max(0, ent.start_char - 20):min(len(doc.text), ent.end_char + 20)]
+                total_match = re.search(r'\$?\d+\.\d+', context)
+                if total_match:
+                    start = doc.text.find(total_match.group(0))
+                    end = start + len(total_match.group(0))
+                    span = doc.char_span(start, end, label="TOTAL")
+                    if span:
+                        new_ents.append(span)
+                else:
+                    new_ents.append(ent)
+
+        else:
+            new_ents.append(ent)
+
+    doc.ents = new_ents
+    return doc
 
 # Configuración
 random.seed(42)
@@ -621,75 +670,11 @@ class SROIESpacyAugmenter:
     def add_post_processing(self):
         """
         Agrega componente de post-procesamiento al pipeline de spaCy.
+        El componente está registrado globalmente como 'sroie_post_process'.
         """
-        def post_process_predictions(doc):
-            """
-            Aplica reglas de post-procesamiento para mejorar la precisión.
-            
-            Args:
-                doc: Documento spaCy.
-                
-            Returns:
-                Documento spaCy procesado.
-            """
-            # Lista para almacenar entidades corregidas
-            new_ents = []
-            
-            for ent in doc.ents:
-                # Regla 1: Corregir fechas mal formateadas
-                if ent.label_ == "DATE":
-                    # Verificar formato de fecha con expresiones regulares
-                    if re.match(r'\d{2}/\d{2}/\d{4}', ent.text) or re.match(r'\d{2}-\d{2}-\d{4}', ent.text):
-                        # Mantener la entidad
-                        new_ents.append(ent)
-                    else:
-                        # Buscar fecha en el texto cercano
-                        context = doc.text[max(0, ent.start_char - 20):min(len(doc.text), ent.end_char + 20)]
-                        date_match = re.search(r'\d{2}[/-]\d{2}[/-]\d{4}', context)
-                        if date_match:
-                            # Crear nueva entidad con la fecha encontrada
-                            start = doc.text.find(date_match.group(0))
-                            end = start + len(date_match.group(0))
-                            span = doc.char_span(start, end, label="DATE")
-                            if span:
-                                new_ents.append(span)
-                        else:
-                            # Mantener la entidad original
-                            new_ents.append(ent)
-                
-                # Regla 2: Verificar totales con formato incorrecto
-                elif ent.label_ == "TOTAL":
-                    # Verificar formato de moneda
-                    if re.match(r'\$?\d+\.\d+', ent.text):
-                        # Mantener la entidad
-                        new_ents.append(ent)
-                    else:
-                        # Buscar total en el texto cercano
-                        context = doc.text[max(0, ent.start_char - 20):min(len(doc.text), ent.end_char + 20)]
-                        total_match = re.search(r'\$?\d+\.\d+', context)
-                        if total_match:
-                            # Crear nueva entidad con el total encontrado
-                            start = doc.text.find(total_match.group(0))
-                            end = start + len(total_match.group(0))
-                            span = doc.char_span(start, end, label="TOTAL")
-                            if span:
-                                new_ents.append(span)
-                        else:
-                            # Mantener la entidad original
-                            new_ents.append(ent)
-                
-                # Mantener otras entidades sin cambios
-                else:
-                    new_ents.append(ent)
-            
-            # Actualizar entidades del documento
-            doc.ents = new_ents
-            return doc
-        
-        # Agregar componente de post-procesamiento al pipeline
-        # Pasamos la función directamente para evitar objetos no serializables
-        if "post_process" not in self.nlp.pipe_names:
-            self.nlp.add_pipe(post_process_predictions, name="post_process", after="ner")
+        if "sroie_post_process" not in self.nlp.pipe_names:
+            # Añadir usando el nombre registrado de la fábrica
+            self.nlp.add_pipe('sroie_post_process', after='ner')
     
     def predict(self, texts: List[str]) -> List[List[Tuple[str, int, int, str]]]:
         """
