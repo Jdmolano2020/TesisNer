@@ -252,7 +252,6 @@ class SROIEDistilBERTAugmenter:
         all_tags = []
         
         # Implementar la carga de datos según el formato específico de SROIE
-        # Esta es una implementación genérica que debe adaptarse al formato real
         
         # Carga de datos
         data_dir_texto = data_dir+"\\box"
