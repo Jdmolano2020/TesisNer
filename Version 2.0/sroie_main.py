@@ -167,12 +167,18 @@ def main():
             )
             
             # Entrenar modelo
-            distilbert_augmenter.train_model(
+            distilbert_metrics = distilbert_augmenter.train_model(
                 augmented_texts, augmented_tags,
                 batch_size=args.batch_size,
                 num_epochs=args.n_iter,
                 model_dir=os.path.join(args.output_dir, "distilbert_model")
             )
+            
+            # Guardar métricas del entrenamiento
+            distilbert_augmenter.save_metrics(distilbert_metrics, args.output_dir)
+            
+            # Graficar métricas
+            distilbert_augmenter.plot_metrics(distilbert_metrics, args.output_dir)
             
             logger.info("Modelo DistilBERT guardado en: %s", os.path.join(args.output_dir, 'distilbert_model'))
             logger.info("Modelo DistilBERT guardado")
@@ -195,12 +201,18 @@ def main():
             )
             
             # Entrenar modelo
-            spacy_augmenter.train_model(
+            metrics = spacy_augmenter.train_model(
                 augmented_data,
                 n_iter=args.n_iter,
                 batch_size=args.batch_size,
                 model_dir=os.path.join(args.output_dir, "spacy_model")
             )
+            
+            # Guardar métricas del entrenamiento
+            spacy_augmenter.save_metrics(metrics, args.output_dir)
+            
+            # Graficar métricas
+            spacy_augmenter.plot_metrics(metrics, args.output_dir)
             
             # Agregar post-procesamiento
             spacy_augmenter.add_post_processing()

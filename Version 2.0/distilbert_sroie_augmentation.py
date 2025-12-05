@@ -20,6 +20,8 @@ from sklearn.metrics import precision_recall_fscore_support
 from typing import List, Dict, Tuple, Any, Optional
 import json
 import re
+import matplotlib.pyplot as plt
+from datetime import datetime
 
 # Importar el aumentador de datos
 from sroie_data_augmentation import SROIEDataAugmenter, Entity, Entities
@@ -685,9 +687,109 @@ class SROIEDistilBERTAugmenter:
                     all_predictions.append(pred_labels)
         
         return all_predictions
+    
+    def save_metrics(self, metrics: Dict[str, Any], output_dir: str) -> str:
+        """
+        Guarda las métricas de entrenamiento en archivo JSON.
+        
+        Args:
+            metrics: Diccionario con métricas de entrenamiento.
+            output_dir: Directorio para guardar los resultados.
+            
+        Returns:
+            Ruta del archivo de métricas guardado.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Crear nombre de archivo con timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        metrics_file = os.path.join(output_dir, f"metrics_{timestamp}.json")
+        
+        # Convertir listas numpy a listas Python si es necesario
+        metrics_serializable = {}
+        for key, value in metrics.items():
+            if isinstance(value, list):
+                metrics_serializable[key] = [float(v) if isinstance(v, (np.floating, np.integer, torch.Tensor)) else v for v in value]
+            elif isinstance(value, (np.floating, np.integer, torch.Tensor)):
+                metrics_serializable[key] = float(value)
+            else:
+                metrics_serializable[key] = value
+        
+        # Agregar información adicional
+        metrics_serializable['timestamp'] = timestamp
+        metrics_serializable['model_type'] = 'distilbert'
+        
+        # Guardar JSON
+        with open(metrics_file, 'w', encoding='utf-8') as f:
+            json.dump(metrics_serializable, f, indent=4, ensure_ascii=False)
+        
+        logger.info("Métricas guardadas en: %s", metrics_file)
+        return metrics_file
+    
+    def plot_metrics(self, metrics: Dict[str, Any], output_dir: str) -> str:
+        """
+        Grafica las métricas de entrenamiento (pérdida y métricas de validación).
+        
+        Args:
+            metrics: Diccionario con métricas de entrenamiento.
+            output_dir: Directorio para guardar los gráficos.
+            
+        Returns:
+            Ruta del archivo de gráfico guardado.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        plot_file = os.path.join(output_dir, f"training_metrics_{timestamp}.png")
+        
+        # Crear figura con subplots
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Gráfico 1: Pérdida de entrenamiento y validación
+        if 'train_loss' in metrics and metrics['train_loss']:
+            axes[0, 0].plot(metrics['train_loss'], label='Train Loss', marker='o', color='blue')
+            axes[0, 0].set_xlabel('Época')
+            axes[0, 0].set_ylabel('Pérdida')
+            axes[0, 0].set_title('Pérdida de Entrenamiento')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+        
+        # Gráfico 2: Pérdida de validación
+        if 'val_loss' in metrics and metrics['val_loss']:
+            axes[0, 1].plot(metrics['val_loss'], label='Validation Loss', marker='s', color='red')
+            axes[0, 1].set_xlabel('Época')
+            axes[0, 1].set_ylabel('Pérdida')
+            axes[0, 1].set_title('Pérdida de Validación')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+        
+        # Gráfico 3: Precisión, Recall y F1
+        if 'val_precision' in metrics and metrics['val_precision']:
+            axes[1, 0].plot(metrics['val_precision'], label='Precision', marker='^', color='orange')
+            axes[1, 0].set_xlabel('Época')
+            axes[1, 0].set_ylabel('Score')
+            axes[1, 0].set_title('Precisión de Validación')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+        
+        if 'val_recall' in metrics and metrics['val_recall']:
+            axes[1, 1].plot(metrics['val_recall'], label='Recall', marker='d', color='green')
+            if 'val_f1' in metrics and metrics['val_f1']:
+                axes[1, 1].plot(metrics['val_f1'], label='F1', marker='s', color='purple')
+            axes[1, 1].set_xlabel('Época')
+            axes[1, 1].set_ylabel('Score')
+            axes[1, 1].set_title('Recall y F1 de Validación')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        logger.info("Gráfico de métricas guardado en: %s", plot_file)
+        plt.close()
+        
+        return plot_file
 
 
-# Ejemplo de uso
 if __name__ == "__main__":
     try:
         # Ejemplo de datos

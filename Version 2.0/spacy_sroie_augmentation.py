@@ -19,6 +19,8 @@ import json
 import re
 import unicodedata
 from difflib import SequenceMatcher
+import matplotlib.pyplot as plt
+from datetime import datetime
 
 # Importar el aumentador de datos
 from sroie_data_augmentation import SROIEDataAugmenter, Entity, Entities
@@ -775,9 +777,136 @@ class SROIESpacyAugmenter:
             predictions.append(entities)
         
         return predictions
+    
+    def save_metrics(self, metrics: Dict[str, Any], output_dir: str) -> str:
+        """
+        Guarda las métricas de entrenamiento en archivo JSON.
+        
+        Args:
+            metrics: Diccionario con métricas de entrenamiento.
+            output_dir: Directorio para guardar los resultados.
+            
+        Returns:
+            Ruta del archivo de métricas guardado.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Crear nombre de archivo con timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        metrics_file = os.path.join(output_dir, f"metrics_{timestamp}.json")
+        
+        # Convertir listas numpy a listas Python si es necesario
+        metrics_serializable = {}
+        for key, value in metrics.items():
+            if isinstance(value, list):
+                metrics_serializable[key] = [float(v) if isinstance(v, (np.floating, np.integer)) else v for v in value]
+            elif isinstance(value, (np.floating, np.integer)):
+                metrics_serializable[key] = float(value)
+            else:
+                metrics_serializable[key] = value
+        
+        # Agregar información adicional
+        metrics_serializable['timestamp'] = timestamp
+        metrics_serializable['model_type'] = 'spacy'
+        
+        # Guardar JSON
+        with open(metrics_file, 'w', encoding='utf-8') as f:
+            json.dump(metrics_serializable, f, indent=4, ensure_ascii=False)
+        
+        logger.info("Métricas guardadas en: %s", metrics_file)
+        return metrics_file
+    
+    def plot_metrics(self, metrics: Dict[str, Any], output_dir: str) -> str:
+        """
+        Grafica las métricas de entrenamiento (F1 y pérdida).
+        
+        Args:
+            metrics: Diccionario con métricas de entrenamiento.
+            output_dir: Directorio para guardar los gráficos.
+            
+        Returns:
+            Ruta del archivo de gráfico guardado.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        plot_file = os.path.join(output_dir, f"training_metrics_{timestamp}.png")
+        
+        # Crear figura con subplots
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Gráfico de pérdida de entrenamiento
+        if 'train_loss' in metrics and metrics['train_loss']:
+            axes[0].plot(metrics['train_loss'], label='Train Loss', marker='o')
+            axes[0].set_xlabel('Época')
+            axes[0].set_ylabel('Pérdida')
+            axes[0].set_title('Pérdida de Entrenamiento por Época')
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+        
+        # Gráfico de F1 de validación
+        if 'val_f1' in metrics and metrics['val_f1']:
+            axes[1].plot(metrics['val_f1'], label='Validation F1', marker='s', color='green')
+            axes[1].set_xlabel('Época')
+            axes[1].set_ylabel('F1 Score')
+            axes[1].set_title('F1 Score de Validación por Época')
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+        
+        # Si hay otras métricas de validación
+        if 'val_precision' in metrics and metrics['val_precision']:
+            axes[1].plot(metrics['val_precision'], label='Validation Precision', marker='^', color='orange')
+        if 'val_recall' in metrics and metrics['val_recall']:
+            axes[1].plot(metrics['val_recall'], label='Validation Recall', marker='d', color='red')
+        
+        if 'val_precision' in metrics or 'val_recall' in metrics:
+            axes[1].legend()
+        
+        plt.tight_layout()
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        logger.info("Gráfico de métricas guardado en: %s", plot_file)
+        plt.close()
+        
+        return plot_file
+    
+    def plot_cv_results(self, cv_f1_scores: List[float], output_dir: str) -> str:
+        """
+        Grafica resultados de validación cruzada.
+        
+        Args:
+            cv_f1_scores: Lista de scores F1 para cada fold.
+            output_dir: Directorio para guardar el gráfico.
+            
+        Returns:
+            Ruta del archivo de gráfico guardado.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        plot_file = os.path.join(output_dir, f"cv_results_{timestamp}.png")
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        folds = [f"Fold {i+1}" for i in range(len(cv_f1_scores))]
+        ax.bar(folds, cv_f1_scores, color='steelblue', alpha=0.7)
+        ax.axhline(y=np.mean(cv_f1_scores), color='red', linestyle='--', label=f'Promedio: {np.mean(cv_f1_scores):.4f}')
+        ax.set_ylabel('F1 Score')
+        ax.set_title('Resultados de Validación Cruzada (5-Fold)')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Agregar valores en las barras
+        for i, (fold, score) in enumerate(zip(folds, cv_f1_scores)):
+            ax.text(i, score + 0.01, f'{score:.4f}', ha='center', va='bottom')
+        
+        plt.tight_layout()
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        logger.info("Gráfico de validación cruzada guardado en: %s", plot_file)
+        plt.close()
+        
+        return plot_file
 
 
-# Ejemplo de uso
 if __name__ == "__main__":
     try:
         # Ejemplo de datos
