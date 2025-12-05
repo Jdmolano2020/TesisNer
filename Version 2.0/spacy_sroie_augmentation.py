@@ -17,6 +17,8 @@ from sklearn.model_selection import KFold
 from typing import List, Dict, Tuple, Any, Optional
 import json
 import re
+import unicodedata
+from difflib import SequenceMatcher
 
 # Importar el aumentador de datos
 from sroie_data_augmentation import SROIEDataAugmenter, Entity, Entities
@@ -75,6 +77,72 @@ def sroie_post_process(doc):
 # Configuración
 random.seed(42)
 np.random.seed(42)
+
+
+def normalize_text(text: str) -> str:
+    """
+    Normaliza texto: NFKC unicode, espacios múltiples, caracteres especiales.
+    """
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def try_fix_entity_alignment(nlp, text: str, start: int, end: int, label: str) -> Optional[Tuple[int, int]]:
+    """
+    Intenta encontrar y alinear una entidad usando múltiples estrategias.
+    Devuelve (new_start, new_end) si logra alinear, None si no puede.
+    """
+    if start < 0 or end > len(text) or start >= end:
+        return None
+
+    ent_text = text[start:end].strip()
+    if not ent_text:
+        return None
+
+    cleaned_text = normalize_text(text)
+    try:
+        doc = nlp.make_doc(cleaned_text)
+    except Exception:
+        return None
+
+    # Estrategia 1: char_span con alignment_mode contract (ajusta a tokens)
+    for mode in ("contract", "expand"):
+        try:
+            span = doc.char_span(start, end, label=label, alignment_mode=mode)
+            if span is not None:
+                return span.start_char, span.end_char
+        except Exception:
+            pass
+
+    # Estrategia 2: búsqueda exacta en texto normalizado
+    pos = cleaned_text.find(ent_text)
+    if pos != -1:
+        return pos, pos + len(ent_text)
+
+    # Estrategia 3: búsqueda de versión normalizada de la entidad
+    ent_norm = normalize_text(ent_text)
+    pos = cleaned_text.find(ent_norm)
+    if pos != -1:
+        return pos, pos + len(ent_norm)
+
+    # Estrategia 4: búsqueda fuzzy (similitud con tokens)
+    try:
+        tokens = [t.text for t in doc]
+        best = None
+        for i in range(len(tokens)):
+            for j in range(i, min(i + 10, len(tokens))):
+                span = doc[i:j+1]
+                joined_text = span.text
+                similarity = SequenceMatcher(None, ent_text, joined_text).ratio()
+                if best is None or similarity > best[0]:
+                    best = (similarity, span.start_char, span.end_char)
+        if best and best[0] > 0.7:
+            return best[1], best[2]
+    except Exception:
+        pass
+
+    return None
 
 def parse(line):
     fields = line.strip().split(",")
@@ -153,7 +221,7 @@ class SROIESpacyAugmenter:
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
         text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
-        text_files = text_files[:10] #para realizar pruebas con pocos archivos
+        #text_files = text_files[:10] #para realizar pruebas con pocos archivos
 
         for text_file in text_files:
             # Cargar texto
@@ -466,8 +534,8 @@ class SROIESpacyAugmenter:
 
     def _validate_and_fix_alignment(self, text: str, entities: List[Tuple[int, int, str]]) -> Tuple[str, List[Tuple[int, int, str]]]:
         """
-        Valida la alineación de entidades con el texto y corrige posiciones si es necesario.
-        Limpia espacios en blanco y caracteres problemáticos del texto.
+        Valida y corrige la alineación de entidades usando múltiples estrategias.
+        Normaliza espacios, intenta realinear con char_span, búsqueda exacta y fuzzy.
 
         Args:
             text: Texto original.
@@ -476,12 +544,12 @@ class SROIESpacyAugmenter:
         Returns:
             Tuple con (texto_limpiado, entidades_validadas).
         """
-        # Normalizar espacios múltiples y saltos de línea
-        cleaned_text = re.sub(r'\s+', ' ', text).strip()
+        # Normalizar espacios y caracteres especiales
+        cleaned_text = normalize_text(text)
 
-        # Validar y corregir cada entidad
         valid_entities = []
         removed_count = 0
+        recovered_count = 0
 
         for start, end, label in entities:
             if start is None or end is None or label is None:
@@ -501,34 +569,44 @@ class SROIESpacyAugmenter:
                     removed_count += 1
                     continue
 
-                # Buscar la entidad en el texto limpiado (tolerancia a espacios)
+                # Primero intentar alineación avanzada
+                fixed_pos = try_fix_entity_alignment(self.nlp or spacy.blank('es'), text, start, end, label)
+
+                if fixed_pos:
+                    new_start, new_end = fixed_pos
+                    valid_entities.append((new_start, new_end, label))
+                    if (new_start, new_end) != (start, end):
+                        recovered_count += 1
+                        logger.debug("Recuperada entidad '%s' (label=%s): (%d,%d) -> (%d,%d)",
+                                    entity_text[:30], label, start, end, new_start, new_end)
+                    continue
+
+                # Si alineación avanzada falla, intentar búsqueda simple
                 found_pos = cleaned_text.find(entity_text)
                 if found_pos == -1:
-                    # Si no se encuentra exactamente, intentar buscar sin caracteres especiales
                     entity_normalized = re.sub(r'\s+', ' ', entity_text)
                     found_pos = cleaned_text.find(entity_normalized)
 
-                if found_pos == -1:
-                    logger.debug("No se pudo alinear entidad '%s' (label=%s) en el texto limpiado", entity_text[:50], label)
-                    removed_count += 1
-                    continue
+                if found_pos != -1:
+                    new_start = found_pos
+                    new_end = found_pos + len(entity_text)
+                    if new_start >= 0 and new_end <= len(cleaned_text):
+                        valid_entities.append((new_start, new_end, label))
+                        recovered_count += 1
+                        logger.debug("Realineada entidad '%s' (label=%s): búsqueda", entity_text[:30], label)
+                        continue
 
-                # Usar las nuevas posiciones
-                new_start = found_pos
-                new_end = found_pos + len(entity_text)
-
-                # Verificar validez final
-                if new_start >= 0 and new_end <= len(cleaned_text):
-                    valid_entities.append((new_start, new_end, label))
-                else:
-                    removed_count += 1
+                # No se pudo alinear
+                logger.debug("No se pudo alinear entidad '%s' (label=%s)", entity_text[:50], label)
+                removed_count += 1
 
             except Exception as e:
                 logger.debug("Error al procesar entidad: %s", e)
                 removed_count += 1
 
-        if removed_count > 0:
-            logger.debug("_validate_and_fix_alignment: removidas %d/%d entidades por alineación", removed_count, len(entities))
+        if removed_count > 0 or recovered_count > 0:
+            logger.info("_validate_and_fix_alignment: %d recuperadas, %d removidas (total: %d)",
+                       recovered_count, removed_count, len(entities))
 
         return cleaned_text, valid_entities
     
