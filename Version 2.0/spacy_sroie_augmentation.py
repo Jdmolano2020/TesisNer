@@ -240,18 +240,6 @@ class SROIESpacyAugmenter:
                 entities = []
                 for entity_type, values in annotations.items():
                     for value in values:
-                        if len(value)==0:
-                            continue
-                        else:
-                            value=value.translate(str.maketrans({"-":  r"\-",
-                                                                        "]":  r"\]",
-                                                                        "\\": r"\\",
-                                                                        "^":  r"\^",
-                                                                        "$":  r"\$",
-                                                                        "*":  r"\*",
-                                                                        ".":  r"\.",
-                                                                        "(":  r"\(",
-                                                                        ")":  r"\)" }))
                         # Buscar la posición de la entidad en el texto
                         start = text.find(value)
                         if start != -1:
@@ -472,9 +460,17 @@ class SROIESpacyAugmenter:
             # Actualizar métricas
             metrics['cv_f1'] = avg_f1
         
-        # Entrenar modelo final con todos los datos
+        # Entrenar modelo final con datos divididos en entrenamiento y evaluación
         logger.info("Entrenando modelo final con todos los datos...")
-        final_metrics = self._train_fold(self.nlp, spacy_data, None, n_iter, batch_size, dropout)
+        
+        # Dividir datos en 80% entrenamiento y 20% evaluación
+        split_idx = int(len(spacy_data) * 0.8)
+        final_train_data = spacy_data[:split_idx]
+        final_eval_data = spacy_data[split_idx:]
+        
+        logger.info("Datos de entrenamiento final: %d, Datos de evaluación: %d", len(final_train_data), len(final_eval_data))
+        
+        final_metrics = self._train_fold(self.nlp, final_train_data, final_eval_data, n_iter, batch_size, dropout)
         
         # Actualizar métricas
         metrics.update(final_metrics)
