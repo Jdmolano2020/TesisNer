@@ -439,7 +439,7 @@ class SROIESpacyAugmenter:
             data_indices = list(range(len(spacy_data)))
             
             for fold, (train_idx, val_idx) in enumerate(kf.split(data_indices)):
-                print(f"Entrenando fold {fold+1}/5...")
+                logger.info("Entrenando fold %d/5...", fold+1)
                 
                 # Obtener datos de entrenamiento y validación para este fold
                 fold_train_data = [spacy_data[i] for i in train_idx]
@@ -465,13 +465,13 @@ class SROIESpacyAugmenter:
             
             # Calcular F1 promedio de validación cruzada
             avg_f1 = sum(cv_results) / len(cv_results)
-            print(f"F1 promedio en validación cruzada: {avg_f1:.4f}")
+            logger.info("F1 promedio en validación cruzada: %.4f", avg_f1)
             
             # Actualizar métricas
             metrics['cv_f1'] = avg_f1
         
         # Entrenar modelo final con todos los datos
-        print("Entrenando modelo final con todos los datos...")
+        logger.info("Entrenando modelo final con todos los datos...")
         final_metrics = self._train_fold(self.nlp, spacy_data, None, n_iter, batch_size, dropout)
         
         # Actualizar métricas
@@ -687,11 +687,11 @@ class SROIESpacyAugmenter:
                 fold_metrics['val_recall'].append(val_metrics['recall'])
                 fold_metrics['val_f1'].append(val_metrics['f1'])
                 
-                print(f"Epoch {epoch+1}/{n_iter}")
-                print(f"Train Loss: {losses.get('ner', 0.0):.4f}")
-                print(f"Val Precision: {val_metrics['precision']:.4f}")
-                print(f"Val Recall: {val_metrics['recall']:.4f}")
-                print(f"Val F1: {val_metrics['f1']:.4f}")
+                logger.info("Epoch %d/%d", epoch+1, n_iter)
+                logger.info("Train Loss: %.4f", losses.get('ner', 0.0))
+                logger.info("Val Precision: %.4f", val_metrics['precision'])
+                logger.info("Val Recall: %.4f", val_metrics['recall'])
+                logger.info("Val F1: %.4f", val_metrics['f1'])
                 
                 # Early stopping
                 if val_metrics['f1'] > best_val_f1:
@@ -700,11 +700,11 @@ class SROIESpacyAugmenter:
                 else:
                     patience_counter += 1
                     if patience_counter >= patience:
-                        print(f"Early stopping activado después de {epoch+1} épocas")
+                        logger.info("Early stopping activado después de %d épocas", epoch+1)
                         break
             else:
-                print(f"Epoch {epoch+1}/{n_iter}")
-                print(f"Train Loss: {losses.get('ner', 0.0):.4f}")
+                logger.info("Epoch %d/%d", epoch+1, n_iter)
+                logger.info("Train Loss: %.4f", losses.get('ner', 0.0))
         
         return fold_metrics
     

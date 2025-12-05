@@ -74,7 +74,6 @@ def main():
     use_gpu = args.use_gpu and torch.cuda.is_available()
     if args.use_gpu and not torch.cuda.is_available():
         logger.info("ADVERTENCIA: GPU solicitada pero no disponible. Usando CPU.")
-        print("ADVERTENCIA: GPU solicitada pero no disponible. Usando CPU.")
     
     # Guardar configuración
     config = vars(args)
@@ -86,7 +85,7 @@ def main():
     # Modo de evaluación
     if args.evaluate:
         logger.info("Modo de evaluación: comparando técnicas de aumentación de datos")
-        print("Modo de evaluación: comparando técnicas de aumentación de datos")
+        logger.info("Modo de evaluación: comparando técnicas de aumentación de datos")
         
         # Crear evaluador
         evaluator = SROIEEvaluator(args.data_dir, use_gpu=use_gpu)
@@ -96,7 +95,7 @@ def main():
         
         # Evaluar técnicas según el modelo seleccionado
         if args.model_type in ['distilbert', 'both']:
-            print("\nEvaluando técnicas para DistilBERT...")
+            logger.info("Evaluando técnicas para DistilBERT...")
             distilbert_results = evaluator.evaluate_augmentation_techniques(
                 model_type="distilbert",
                 techniques=["original", "back_translation", "ter", "cwr", 
@@ -118,10 +117,10 @@ def main():
                 batch_size=args.batch_size
             )
             
-            print(f"\nModelo DistilBERT final guardado en: {os.path.join(evaluator.results_dir, 'final_distilbert_model')}")
+            logger.info("Modelo DistilBERT final guardado en: %s", os.path.join(evaluator.results_dir, 'final_distilbert_model'))
             logger.info("Modelo DistilBERT final guardado")
         if args.model_type in ['spacy', 'both']:
-            print("\nEvaluando técnicas para spaCy...")
+            logger.info("Evaluando técnicas para spaCy...")
             logger.info("Evaluando técnicas para spaCy...")
             spacy_results = evaluator.evaluate_augmentation_techniques(
                 model_type="spacy",
@@ -144,16 +143,16 @@ def main():
                 batch_size=args.batch_size
             )
             
-            print(f"\nModelo spaCy final guardado en: {os.path.join(evaluator.results_dir, 'final_spacy_model')}")
+            logger.info("Modelo spaCy final guardado en: %s", os.path.join(evaluator.results_dir, 'final_spacy_model'))
             logger.info("Modelo spaCy final guardado...")
     
     # Modo de entrenamiento directo
     else:
-        print(f"Entrenando modelo(s) con técnica: {args.technique}, aumentaciones: {args.num_augmentations}")
+        logger.info("Entrenando modelo(s) con técnica: %s, aumentaciones: %d", args.technique, args.num_augmentations)
         logger.info("Entrenando modelo(s) con técnica: %s, aumentaciones: %d", args.technique, args.num_augmentations)
         # Entrenar según el modelo seleccionado
         if args.model_type in ['distilbert', 'both']:
-            print("\nEntrenando modelo DistilBERT...")
+            logger.info("Entrenando modelo DistilBERT...")
             logger.info("Entrenando modelo DistilBERT...")
             
             # Crear aumentador
@@ -175,10 +174,10 @@ def main():
                 model_dir=os.path.join(args.output_dir, "distilbert_model")
             )
             
-            print(f"\nModelo DistilBERT guardado en: {os.path.join(args.output_dir, 'distilbert_model')}")
+            logger.info("Modelo DistilBERT guardado en: %s", os.path.join(args.output_dir, 'distilbert_model'))
             logger.info("Modelo DistilBERT guardado")
         if args.model_type in ['spacy', 'both']:
-            print("\nEntrenando modelo spaCy...")
+            logger.info("Entrenando modelo spaCy...")
             logger.info("Entrenando modelo spaCy...")
 
             # Crear aumentador
@@ -209,9 +208,8 @@ def main():
             # Guardar modelo final
             spacy_augmenter.nlp.to_disk(os.path.join(args.output_dir, "spacy_model"))
             
-            print(f"\nModelo spaCy guardado en: {os.path.join(args.output_dir, 'spacy_model')}")
+            logger.info("Modelo spaCy guardado en: %s", os.path.join(args.output_dir, 'spacy_model'))
             logger.info("Modelo spaCy guardado")
-    print("\nProceso completado.")
     logger.info("Proceso completado.")
 
 if __name__ == "__main__":

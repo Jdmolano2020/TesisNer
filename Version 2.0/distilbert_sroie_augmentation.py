@@ -247,7 +247,7 @@ class SROIEDistilBERTAugmenter:
             Tuple con listas de textos y etiquetas.
         """
         
-        print("Inicio carga datos para DistilBERT...")
+        logger.info("Inicio carga datos para DistilBERT...")
         texts = []
         all_tags = []
         
@@ -257,7 +257,7 @@ class SROIEDistilBERTAugmenter:
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
         text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
-        text_files = text_files[:10] #para realizar pruebas con pocos archivos
+        #text_files = text_files[:10] #para realizar pruebas con pocos archivos
         for text_file in text_files:
             # Cargar texto
             with open(os.path.join(data_dir_texto, text_file), 'r', encoding='utf-8', errors='ignore') as f:
@@ -603,12 +603,12 @@ class SROIEDistilBERTAugmenter:
             metrics['val_recall'].append(val_recall)
             metrics['val_f1'].append(val_f1)
             
-            print(f"Epoch {epoch+1}/{num_epochs}")
-            print(f"Train Loss: {avg_train_loss:.4f}")
-            print(f"Val Loss: {avg_val_loss:.4f}")
-            print(f"Val Precision: {val_precision:.4f}")
-            print(f"Val Recall: {val_recall:.4f}")
-            print(f"Val F1: {val_f1:.4f}")
+            logger.info("Epoch %d/%d", epoch+1, num_epochs)
+            logger.info("Train Loss: %.4f", avg_train_loss)
+            logger.info("Val Loss: %.4f", avg_val_loss)
+            logger.info("Val Precision: %.4f", val_precision)
+            logger.info("Val Recall: %.4f", val_recall)
+            logger.info("Val F1: %.4f", val_f1)
             
             # Early stopping
             if val_f1 > best_val_f1:
@@ -617,11 +617,11 @@ class SROIEDistilBERTAugmenter:
                 
                 # Guardar el mejor modelo
                 torch.save(self.model.state_dict(), best_model_path)
-                print(f"Nuevo mejor modelo guardado con F1: {val_f1:.4f}")
+                logger.info("Nuevo mejor modelo guardado con F1: %.4f", val_f1)
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    print(f"Early stopping activado después de {epoch+1} épocas")
+                    logger.info("Early stopping activado después de %d épocas", epoch+1)
                     break
         
         # Cargar el mejor modelo
