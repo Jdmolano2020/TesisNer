@@ -9,6 +9,7 @@ import os
 import argparse
 import torch
 import json
+import time
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -85,7 +86,6 @@ def main():
     # Modo de evaluación
     if args.evaluate:
         logger.info("Modo de evaluación: comparando técnicas de aumentación de datos")
-        logger.info("Modo de evaluación: comparando técnicas de aumentación de datos")
         
         # Crear evaluador
         evaluator = SROIEEvaluator(args.data_dir, use_gpu=use_gpu)
@@ -121,7 +121,7 @@ def main():
             logger.info("Modelo DistilBERT final guardado")
         if args.model_type in ['spacy', 'both']:
             logger.info("Evaluando técnicas para spaCy...")
-            logger.info("Evaluando técnicas para spaCy...")
+
             spacy_results = evaluator.evaluate_augmentation_techniques(
                 model_type="spacy",
                 techniques=["original", "back_translation", "ter", "cwr", 
@@ -149,10 +149,9 @@ def main():
     # Modo de entrenamiento directo
     else:
         logger.info("Entrenando modelo(s) con técnica: %s, aumentaciones: %d", args.technique, args.num_augmentations)
-        logger.info("Entrenando modelo(s) con técnica: %s, aumentaciones: %d", args.technique, args.num_augmentations)
+ 
         # Entrenar según el modelo seleccionado
         if args.model_type in ['distilbert', 'both']:
-            logger.info("Entrenando modelo DistilBERT...")
             logger.info("Entrenando modelo DistilBERT...")
             
             # Crear aumentador
@@ -183,7 +182,6 @@ def main():
             logger.info("Modelo DistilBERT guardado en: %s", os.path.join(args.output_dir, 'distilbert_model'))
             logger.info("Modelo DistilBERT guardado")
         if args.model_type in ['spacy', 'both']:
-            logger.info("Entrenando modelo spaCy...")
             logger.info("Entrenando modelo spaCy...")
 
             # Crear aumentador
@@ -223,7 +221,66 @@ def main():
             logger.info("Modelo spaCy guardado en: %s", os.path.join(args.output_dir, 'spacy_model'))
             logger.info("Modelo spaCy guardado")
     logger.info("Proceso completado.")
+     # Si se entrenaron ambos modelos, realizar demostración de complementación
+    try:
+        if args.model_type == 'both' and 'final_distilbert_model' in locals() and 'final_spacy_model' in locals():
+            logger.info("Realizando demostración de complementación entre DistilBERT y spaCy...")
 
+            # Tomar una muestra pequeña de evaluación
+            sample_size = min(10, len(evaluator.spacy_data))
+            sample = evaluator.spacy_data[:sample_size]
+            texts = [t for t, _ in sample]
+
+            # Gold entities
+            gold_list = [set([(s, e, lab) for s, e, lab in ann['entities']]) for _, ann in sample]
+
+            # Predicciones spaCy
+            spacy_preds_raw = final_spacy_model.predict(texts)
+            spacy_preds = [set([(st, ed, lab) for _, st, ed, lab in doc_ents]) for doc_ents in spacy_preds_raw]
+
+            # Predicciones DistilBERT
+            distil_tags = final_distilbert_model.predict(texts)
+            distil_preds = []
+            for txt, tags in zip(texts, distil_tags):
+                ents = final_distilbert_model.convert_tags_to_entities(txt, tags)
+                # convert to (start,end,label)
+                ents_set = set([(s, e, lab) for _, s, e, lab in ents])
+                distil_preds.append(ents_set)
+
+            # Métricas: función auxiliar
+            def compute_metrics(gold_list, pred_list):
+                tp = fp = fn = 0
+                for gold, pred in zip(gold_list, pred_list):
+                    tp += len(gold & pred)
+                    fp += len(pred - gold)
+                    fn += len(gold - pred)
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+                return {'precision': precision, 'recall': recall, 'f1': f1, 'tp': tp, 'fp': fp, 'fn': fn}
+
+            spacy_metrics = compute_metrics(gold_list, spacy_preds)
+            distil_metrics = compute_metrics(gold_list, distil_preds)
+
+            # Unión simple de predicciones (complementación)
+            union_preds = [s | d for s, d in zip(spacy_preds, distil_preds)]
+            union_metrics = compute_metrics(gold_list, union_preds)
+
+            report = {
+                'sample_size': sample_size,
+                'spacy': spacy_metrics,
+                'distilbert': distil_metrics,
+                'union': union_metrics
+            }
+
+            # Guardar informe
+            report_path = os.path.join(args.output_dir, 'complementation_report.json')
+            with open(report_path, 'w', encoding='utf-8') as rf:
+                json.dump(report, rf, indent=2, ensure_ascii=False)
+
+            logger.info("Informe de complementación guardado en: %s", report_path)
+    except Exception as e:
+                logger.exception("Error durante la demostración de complementación: %s", e)
 if __name__ == "__main__":
     try:
         main()
