@@ -8,6 +8,7 @@ aumentación de datos en la solución basada en spaCy para el dataset SROIE.
 import os
 import random
 import numpy as np
+import pandas as pd
 import spacy
 from spacy.training import Example
 from spacy.language import Language
@@ -80,6 +81,18 @@ def sroie_post_process(doc):
 random.seed(42)
 np.random.seed(42)
 
+def parse(line):
+    fields = line.strip().split(",")
+    if len(fields) == 9:
+        return fields
+    else:
+        return fields[:8] + [",".join(fields[8:])]
+
+
+def build_text(data):
+    text = " ".join(data.text)
+    text = text.replace("  "," ")
+    return text
 
 def normalize_text(text: str) -> str:
     """
@@ -146,21 +159,6 @@ def try_fix_entity_alignment(nlp, text: str, start: int, end: int, label: str) -
 
     return None
 
-def parse(line):
-    fields = line.strip().split(",")
-    if len(fields) == 9:
-        return fields
-    else:
-        return fields[:8] + [",".join(fields[8:])]
-
-
-def build_text(data):
-    text = " ".join(data.text)
-    text = text.replace("  "," ")
-    
-    return text
-
-
 class SROIESpacyAugmenter:
     """Clase para integrar aumentación de datos en la solución spaCy para SROIE."""
     
@@ -185,15 +183,11 @@ class SROIESpacyAugmenter:
         """
         # Crear modelo base
         self.nlp = spacy.blank(lang)
-        
-        # Agregar componente EntityRuler para reglas específicas de dominio
-        self.entity_ruler = self.nlp.add_pipe("entity_ruler")
-        
-        # Agregar componente NER después del EntityRuler
-        if "ner" not in self.nlp.pipe_names:
-            self.ner = self.nlp.add_pipe("ner", after="entity_ruler")
-        else:
-            self.ner = self.nlp.get_pipe("ner")
+        # No añadimos EntityRuler aquí para evitar crear el componente sin
+        # patrones (que puede producir warnings). Lo añadiremos en
+        # `train_model` cuando tengamos los `patterns` generados.
+        self.entity_ruler = None
+        self.ner = None
     
     def add_entity_patterns(self, patterns: List[Dict]):
         """
@@ -202,9 +196,14 @@ class SROIESpacyAugmenter:
         Args:
             patterns: Lista de patrones para el EntityRuler.
         """
+        # Crear el EntityRuler si no existe (agregar por nombre y obtener el pipe)
         if self.entity_ruler is None:
-            raise ValueError("El EntityRuler no está inicializado.")
-        
+            if "entity_ruler" not in self.nlp.pipe_names:
+                # Añadimos el componente por su factory name
+                self.nlp.add_pipe("entity_ruler")
+            self.entity_ruler = self.nlp.get_pipe("entity_ruler")
+
+        # Añadir patrones
         self.entity_ruler.add_patterns(patterns)
     
     def load_data(self, data_dir: str) -> List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]]:
@@ -223,12 +222,15 @@ class SROIESpacyAugmenter:
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
         text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
-        #text_files = text_files[:10] #para realizar pruebas con pocos archivos
+        text_files = text_files[:5] #para realizar pruebas con pocos archivos
 
         for text_file in text_files:
             # Cargar texto
             with open(os.path.join(data_dir_texto, text_file), 'r', encoding='utf-8') as f:
-                text = f.read().strip()
+                text = f.readlines()
+            data = pd.DataFrame(list(map(parse, text)), columns=[*(f"coor{i}" for i in range(8)), "text"])
+            data = data.dropna()
+            text = build_text(data)
             
             # Cargar etiquetas correspondientes
             tag_file = text_file
@@ -319,7 +321,8 @@ class SROIESpacyAugmenter:
         
         # Generar datos sintéticos
         synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
-            texts, all_entities, num_augmentations=num_augmentations
+            texts, all_entities, num_augmentations=num_augmentations,
+            use_parallel=True,use_threads=True, num_workers=6
         )
         
         # Filtrar datos sintéticos de baja calidad
@@ -403,14 +406,24 @@ class SROIESpacyAugmenter:
         # Crear directorio para modelos si no existe
         os.makedirs(model_dir, exist_ok=True)
         
+        # Crear patrones para el EntityRuler
+        patterns = self.create_entity_patterns(spacy_data)
+        # Añadir EntityRuler y sus patrones (se crea si falta)
+        self.add_entity_patterns(patterns)
+
+        # Asegurarnos de que el componente NER exista después del EntityRuler
+        if "ner" not in self.nlp.pipe_names:
+            self.ner = self.nlp.add_pipe("ner", after="entity_ruler")
+        else:
+            self.ner = self.nlp.get_pipe("ner")
+
         # Agregar etiquetas al componente NER
         for _, annotations in spacy_data:
             for _, _, label in annotations["entities"]:
-                self.ner.add_label(label)
-        
-        # Crear patrones para el EntityRuler
-        patterns = self.create_entity_patterns(spacy_data)
-        self.add_entity_patterns(patterns)
+                try:
+                    self.ner.add_label(label)
+                except Exception:
+                    pass
         
         # Métricas de entrenamiento
         metrics = {
@@ -437,9 +450,16 @@ class SROIESpacyAugmenter:
                 
                 # Reiniciar el modelo para este fold
                 fold_nlp = spacy.blank(self.nlp.lang)
-                fold_entity_ruler = fold_nlp.add_pipe("entity_ruler")
+                # Añadir EntityRuler por factory name y obtener el pipe
+                if "entity_ruler" not in fold_nlp.pipe_names:
+                    fold_nlp.add_pipe("entity_ruler")
+                fold_entity_ruler = fold_nlp.get_pipe("entity_ruler")
                 fold_entity_ruler.add_patterns(patterns)
-                fold_ner = fold_nlp.add_pipe("ner", after="entity_ruler")
+                # Añadir NER después del EntityRuler
+                if "ner" not in fold_nlp.pipe_names:
+                    fold_ner = fold_nlp.add_pipe("ner", after="entity_ruler")
+                else:
+                    fold_ner = fold_nlp.get_pipe("ner")
                 
                 # Agregar etiquetas
                 for _, annotations in fold_train_data:
@@ -554,9 +574,43 @@ class SROIESpacyAugmenter:
                 removed_count += 1
                 continue
 
+            # Caso 1: Índices inválidos (negativos o fuera de rango)
             if start < 0 or end > len(text) or start >= end:
-                logger.warning("Entidad inválida (fuera de rango): start=%d, end=%d, len(text)=%d, label=%s", start, end, len(text), label)
-                removed_count += 1
+                logger.warning("Entidad inválida (fuera de rango): start=%d, end=%d, len(text)=%d, label=%s. Intentando recuperar por búsqueda...", start, end, len(text), label)
+                
+                # Intentar recuperar la entidad por búsqueda de patrones
+                # (asumiendo que 'start' y 'end' pueden ser erróneos pero 'label' es correcto)
+                # Buscar una entidad de ese tipo que tenga sentido en el contexto
+                
+                # Si tenemos entity_text en la tupla original (raro), usarla
+                # Si no, intentar patrones comunes basados en el label
+                pattern_found = False
+                
+                # Patrones por tipo de entidad
+                patterns = {
+                    'address': r'[\w\s.,#\-\d]{5,}',  # Dirección: al menos 5 caracteres
+                    'company': r'[A-Z][\w\s\.\&\-]{3,}',  # Empresa: comienza con mayúscula
+                    'date': r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',  # Fecha: formato xx/xx/xxxx
+                    'total': r'\$?\d+[\.,]\d{2}',  # Total: número con decimales
+                }
+                
+                pattern = patterns.get(label.lower())
+                if pattern:
+                    import re
+                    matches = list(re.finditer(pattern, text))
+                    if matches:
+                        # Usar el primer match encontrado
+                        match = matches[0]
+                        new_start, new_end = match.start(), match.end()
+                        entity_text = text[new_start:new_end]
+                        valid_entities.append((new_start, new_end, label))
+                        recovered_count += 1
+                        pattern_found = True
+                        logger.debug("Recuperada entidad '%s' (label=%s) por patrón: (%d,%d)", entity_text[:30], label, new_start, new_end)
+                
+                if not pattern_found:
+                    logger.debug("No se pudo recuperar entidad con label=%s por búsqueda de patrones", label)
+                    removed_count += 1
                 continue
 
             try:
@@ -605,6 +659,7 @@ class SROIESpacyAugmenter:
         if removed_count > 0 or recovered_count > 0:
             logger.info("_validate_and_fix_alignment: %d recuperadas, %d removidas (total: %d)",
                        recovered_count, removed_count, len(entities))
+
 
         return cleaned_text, valid_entities
     
