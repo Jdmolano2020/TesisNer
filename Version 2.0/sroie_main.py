@@ -47,8 +47,8 @@ def parse_args():
     parser.add_argument('--num_augmentations', type=int, default=2,
                        help='Número de aumentaciones a generar por ejemplo')
     
-    parser.add_argument('--batch_size', type=int, default=8,
-                       help='Tamaño del lote para entrenamiento')
+    parser.add_argument('--batch_size', type=int, default=16,
+                       help='Tamaño del lote para entrenamiento (mayor aprovecha más GPU/paralelismo)')
     
     parser.add_argument('--n_iter', type=int, default=50,
                        help='Número de iteraciones/épocas de entrenamiento')
@@ -58,6 +58,10 @@ def parse_args():
     
     parser.add_argument('--use_gpu', action='store_true',
                        help='Usar GPU para el entrenamiento')
+    
+    parser.add_argument('--num_workers', type=int, default=None,
+                       help='Número de workers para paralelismo en carga de datos (0=no paralelo). Si no se especifica, se ajusta automáticamente según memoria/plataforma')
+    
     parser.add_argument('--reset_state', action='store_true',
                        help='Borrar estado de ejecución y comenzar desde el paso 1')
     
@@ -69,6 +73,36 @@ def main():
     """
     # Parsear argumentos
     args = parse_args()
+    
+    # Ajuste automático de num_workers cuando no se especifica
+    if args.num_workers is None:
+        try:
+            import psutil
+            avail_gb = psutil.virtual_memory().available / (1024**3)
+        except Exception:
+            psutil = None
+            avail_gb = None
+        if os.name == 'nt':
+            # En Windows el método 'spawn' tiene overhead mayor; ser conservador
+            if avail_gb is not None and avail_gb < 4:
+                chosen_workers = 0
+            else:
+                chosen_workers = min(2, max(0, (os.cpu_count() or 1) - 1))
+        else:
+            # Unix-like: permitir más workers si hay RAM suficiente
+            if avail_gb is not None:
+                if avail_gb < 2:
+                    chosen_workers = 0
+                elif avail_gb < 8:
+                    chosen_workers = min(2, max(0, (os.cpu_count() or 1) - 1))
+                else:
+                    chosen_workers = min(8, max(0, (os.cpu_count() or 1) - 1))
+            else:
+                chosen_workers = min(4, max(0, (os.cpu_count() or 1) - 1))
+        args.num_workers = int(chosen_workers)
+        logger.info("num_workers no especificado: ajustado automáticamente a %d (avail_gb=%s)", args.num_workers, str(avail_gb))
+    else:
+        logger.info("num_workers especificado por usuario: %d", args.num_workers)
     
     # Crear directorios de salida
     os.makedirs(args.output_dir, exist_ok=True)

@@ -689,10 +689,12 @@ class SROIESpacyAugmenter:
         # Configurar optimizador
         optimizer = nlp.begin_training()
         
-        # Variables para early stopping
+        # Variables para early stopping y timing
         best_val_f1 = 0
         patience = 3
         patience_counter = 0
+        import time
+        epoch_start_time = time.time()
         
         # Entrenar
         for epoch in range(n_iter):
@@ -705,27 +707,31 @@ class SROIESpacyAugmenter:
             # Inicializar pérdida
             losses = {}
             
+            # Entrenar en lotes con procesamiento paralelo de ejemplos
+            from concurrent.futures import ThreadPoolExecutor
+            def create_example(item):
+                text, annotations = item
+                # Primero validar y fijar alineación
+                cleaned_text, aligned_entities = self._validate_and_fix_alignment(text, annotations.get("entities", []))
+                # Luego limpiar duplicados/solapamientos
+                final_entities = self._clean_entities(aligned_entities, text_len=len(cleaned_text))
+                # Crear doc con el texto limpiado
+                doc = nlp.make_doc(cleaned_text)
+                cleaned_annotations = {"entities": final_entities}
+                try:
+                    example = Example.from_dict(doc, cleaned_annotations)
+                    return example
+                except Exception as e:
+                    logger.debug("No se pudo crear Example: %s", e)
+                    return None
+            
             # Entrenar en lotes
             for batch in batches:
-                # Convertir a ejemplos de spaCy
+                # Crear ejemplos en paralelo (limitado a 2 threads para no sobrecargar)
                 examples = []
-                for text, annotations in batch:
-                    # Primero validar y fijar alineación
-                    cleaned_text, aligned_entities = self._validate_and_fix_alignment(text, annotations.get("entities", []))
-                    
-                    # Luego limpiar duplicados/solapamientos
-                    final_entities = self._clean_entities(aligned_entities, text_len=len(cleaned_text))
-                    
-                    # Crear doc con el texto limpiado
-                    doc = nlp.make_doc(cleaned_text)
-                    cleaned_annotations = {"entities": final_entities}
-                    
-                    try:
-                        example = Example.from_dict(doc, cleaned_annotations)
-                        examples.append(example)
-                    except Exception as e:
-                        logger.warning("No se pudo crear Example para texto: %s", e)
-                        continue
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = executor.map(create_example, batch)
+                    examples = [ex for ex in results if ex is not None]
                 
                 # Actualizar modelo
                 nlp.update(examples, drop=dropout, losses=losses)
@@ -745,6 +751,9 @@ class SROIESpacyAugmenter:
                 logger.info("Val Precision: %.4f", val_metrics['precision'])
                 logger.info("Val Recall: %.4f", val_metrics['recall'])
                 logger.info("Val F1: %.4f", val_metrics['f1'])
+                epoch_elapsed = time.time() - epoch_start_time
+                logger.info("Tiempo de época: %.2f segundos", epoch_elapsed)
+                epoch_start_time = time.time()
                 
                 # Early stopping
                 if val_metrics['f1'] > best_val_f1:
