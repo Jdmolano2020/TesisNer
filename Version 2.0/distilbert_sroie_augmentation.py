@@ -163,9 +163,11 @@ class SROIEDistilBERTAugmenter:
             num_labels: Número de etiquetas para clasificación.
             model_name: Nombre del modelo DistilBERT a cargar.
         """
+        logger.info("Cargando modelo %s para clasificación de tokens con %d etiquetas...", model_name, num_labels)
         self.model = DistilBertForTokenClassification.from_pretrained(
             model_name, num_labels=num_labels
         ).to(self.device)
+        logger.info("Modelo cargado correctamente. Las capas de clasificación serán entrenadas desde cero.")
        
     def _convert_to_bio_tags(self, text: str, annotations: Dict) -> List[str]:
         """
@@ -259,7 +261,8 @@ class SROIEDistilBERTAugmenter:
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
         text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
-        #text_files = text_files[:10] #para realizar pruebas con pocos archivos
+        text_files = text_files[:5] #para realizar pruebas con pocos archivos
+        
         for text_file in text_files:
             # Cargar texto
             with open(os.path.join(data_dir_texto, text_file), 'r', encoding='utf-8', errors='ignore') as f:
@@ -593,7 +596,7 @@ class SROIEDistilBERTAugmenter:
             
             # Calcular métricas
             val_precision, val_recall, val_f1, _ = precision_recall_fscore_support(
-                val_true_labels, val_predictions, average='weighted'
+                val_true_labels, val_predictions, average='weighted', zero_division=0
             )
             
             # Calcular pérdida promedio de validación
