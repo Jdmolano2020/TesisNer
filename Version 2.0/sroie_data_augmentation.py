@@ -167,6 +167,7 @@ class SROIEDataAugmenter:
                        source_lang: str = 'es', target_lang: str = 'en') -> Tuple[str, Entities]:
         """
         Implementa back translation con preservación de entidades.
+        Para textos largos, los divide en segmentos, aplica BT a cada uno y recombina.
         
         Args:
             text: Texto original.
@@ -180,12 +181,14 @@ class SROIEDataAugmenter:
         if not self.translation_models:
             self.load_translation_models(source_lang, target_lang)
         
-        # 1. Aplicar máscaras a las entidades
+        tokenizer_src_tgt = self.translation_models[f'{source_lang}-{target_lang}']['tokenizer']
+        max_len = getattr(tokenizer_src_tgt, 'model_max_length', None) or 512
+        
+        # Aplicar máscaras a las entidades
         masked_text = text
         entity_map = {}
         
         # Ordenar entidades por posición de inicio (de mayor a menor)
-        # para evitar problemas con reemplazos que se solapan
         sorted_entities = sorted(entities, key=lambda e: e[1], reverse=True)
         
         for i, (entity_text, start, end, entity_type) in enumerate(sorted_entities):
@@ -193,23 +196,90 @@ class SROIEDataAugmenter:
             masked_text = masked_text[:start] + mask + masked_text[end:]
             entity_map[mask] = (entity_text, start, end, entity_type)
         
-        # 2. Traducir al idioma objetivo
-        # Antes de traducir, comprobar que la secuencia no exceda el máximo
-        tokenizer_src_tgt = self.translation_models[f'{source_lang}-{target_lang}']['tokenizer']
-        max_len = getattr(tokenizer_src_tgt, 'model_max_length', None) or 512
-
-        # Revisar número de tokens; si es demasiado largo, evitamos back-translation
+        # Verificar si el texto cabe en el modelo
         tokenized_len = len(tokenizer_src_tgt.encode(masked_text, add_special_tokens=True))
-        if tokenized_len > max_len:
-            logger.warning("Texto demasiado largo para back_translation (tokens=%d, max=%d). Se omite BT.", tokenized_len, max_len)
-            return text, entities
-
-        translated_text = self.translate(masked_text, source_lang, target_lang)
         
-        # 3. Traducir de vuelta al idioma original
-        back_translated_text = self.translate(translated_text, target_lang, source_lang)
+        if tokenized_len <= max_len:
+            # Caso 1: Texto pequeño, procesar normalmente
+            translated_text = self.translate(masked_text, source_lang, target_lang)
+            back_translated_text = self.translate(translated_text, target_lang, source_lang)
+        else:
+            # Caso 2: Texto grande, dividir por oraciones/puntos y procesarlo en partes
+            logger.info("Texto demasiado largo (tokens=%d, max=%d). Dividiendo en segmentos para BT...", tokenized_len, max_len)
+            
+            # Dividir por puntos finales (. ! ?)
+            import re
+            segments = re.split(r'(\.\s+|\!\s+|\?\s+)', masked_text)
+            
+            # Recombinar segmentos preservando delimitadores
+            combined_segments = []
+            i = 0
+            while i < len(segments):
+                segment = segments[i]
+                if segment and segment[0] not in '.!?':
+                    # Es un texto normal
+                    combined_segments.append(segment)
+                    if i + 1 < len(segments) and segments[i + 1] and segments[i + 1][0] in '.!?':
+                        combined_segments[-1] += segments[i + 1]
+                        i += 2
+                        continue
+                i += 1
+            
+            if not combined_segments:
+                combined_segments = [masked_text]
+            
+            # Procesar cada segmento
+            translated_parts = []
+            for segment in combined_segments:
+                if not segment.strip():
+                    continue
+                
+                segment_tokens = len(tokenizer_src_tgt.encode(segment, add_special_tokens=True))
+                
+                if segment_tokens <= max_len:
+                    # Segmento cabe, traducir normalmente
+                    try:
+                        trans_segment = self.translate(segment, source_lang, target_lang)
+                        back_segment = self.translate(trans_segment, target_lang, source_lang)
+                        translated_parts.append(back_segment)
+                    except Exception as e:
+                        logger.warning("Error traduciendo segmento de %d tokens: %s. Omitiendo traducción.", segment_tokens, e)
+                        translated_parts.append(segment)
+                else:
+                    # Segmento muy largo, dividir por palabras
+                    logger.debug("Segmento aún muy largo (%d tokens). Dividiendo por palabras.", segment_tokens)
+                    words = segment.split()
+                    word_chunks = []
+                    current_chunk = []
+                    current_len = 0
+                    
+                    for word in words:
+                        word_token_len = len(tokenizer_src_tgt.encode(word, add_special_tokens=False))
+                        if current_len + word_token_len < max_len - 50:  # Margen de seguridad
+                            current_chunk.append(word)
+                            current_len += word_token_len
+                        else:
+                            if current_chunk:
+                                word_chunks.append(' '.join(current_chunk))
+                            current_chunk = [word]
+                            current_len = word_token_len
+                    
+                    if current_chunk:
+                        word_chunks.append(' '.join(current_chunk))
+                    
+                    # Traducir cada chunk de palabras
+                    for chunk in word_chunks:
+                        try:
+                            trans_chunk = self.translate(chunk, source_lang, target_lang)
+                            back_chunk = self.translate(trans_chunk, target_lang, source_lang)
+                            translated_parts.append(back_chunk)
+                        except Exception as e:
+                            logger.warning("Error traduciendo chunk: %s. Omitiendo traducción.", e)
+                            translated_parts.append(chunk)
+            
+            back_translated_text = ' '.join(translated_parts)
         
-        # 4. Reinsertar las entidades originales y recalcular posiciones
+        # Reinsertar las entidades originales y recalcular posiciones
         new_entities = []
         final_text = back_translated_text
         
@@ -542,6 +612,8 @@ class SROIEDataAugmenter:
 
             # Iniciar Pool pasando las técnicas necesarias al inicializador si usamos procesos.
             try:
+                total_tasks = len(tasks)
+                logger.info("Total de tareas a procesar: %d", total_tasks)
                 if use_threads:
                     # Compartir la misma instancia de augmenter entre hilos
                     main_augmenter = SROIEDataAugmenter(use_gpu=False)
@@ -554,20 +626,28 @@ class SROIEDataAugmenter:
                         futures = [executor.submit(_thread_worker_augment, main_augmenter, text, entities, entity_pool, technique, i, j)
                                    for (text, entities, entity_pool, technique, i, j) in tasks]
 
+                        completed = 0
+                        log_step = max(1, total_tasks // 20)
                         for fut in as_completed(futures):
                             aug_text, aug_entities, task_idx = fut.result()
                             synthetic_texts.append(aug_text)
                             synthetic_entities.append(aug_entities)
+                            completed += 1
+                            if completed % log_step == 0 or completed == total_tasks:
+                                logger.info("Progreso threads: %d/%d (%.1f%%)", completed, total_tasks, completed * 100.0 / total_tasks)
 
                     logger.info("Paralelización con threads completada. Generados %d textos sintéticos.", len(synthetic_texts))
                 else:
+                    # Usar imap_unordered para procesar resultados conforme se completan y mostrar progreso
                     with Pool(processes=num_workers, initializer=_worker_init, initargs=(list(chosen_techniques), False)) as pool:
-                        results = pool.starmap(_worker_augment, tasks)
-
-                    # Separar resultados
-                    for aug_text, aug_entities, task_idx in results:
-                        synthetic_texts.append(aug_text)
-                        synthetic_entities.append(aug_entities)
+                        completed = 0
+                        log_step = max(1, total_tasks // 20)
+                        for aug_text, aug_entities, task_idx in pool.imap_unordered(_worker_augment_star, tasks):
+                            synthetic_texts.append(aug_text)
+                            synthetic_entities.append(aug_entities)
+                            completed += 1
+                            if completed % log_step == 0 or completed == total_tasks:
+                                logger.info("Progreso procesos: %d/%d (%.1f%%)", completed, total_tasks, completed * 100.0 / total_tasks)
 
                     logger.info("Paralelización con procesos completada. Generados %d textos sintéticos.", len(synthetic_texts))
 
@@ -767,6 +847,13 @@ def _worker_augment(text: str, entities: Entities, entity_pool: Dict[str, List[s
         logger.error("Error en worker para tarea %d.%d: %s", task_idx, sub_idx, e)
         # En caso de error, devolver el texto original
         return text, entities, task_idx
+
+
+def _worker_augment_star(args_tuple):
+    """
+    Wrapper para permitir imap_unordered con Pool pasando una tupla de argumentos.
+    """
+    return _worker_augment(*args_tuple)
 
 
 # Ejemplo de uso
