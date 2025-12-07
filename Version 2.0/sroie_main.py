@@ -244,13 +244,46 @@ def main():
             # Crear aumentador
             distilbert_augmenter = SROIEDistilBERTAugmenter(use_gpu=use_gpu)
             
-            # Cargar datos
-            train_texts, train_tags = distilbert_augmenter.load_data(args.data_dir)
-            
-            # Aumentar datos
-            augmented_texts, augmented_tags = distilbert_augmenter.augment_data(
-                train_texts, train_tags, num_augmentations=args.num_augmentations
-            )
+            # Cargar datos (con checkpoint)
+            distilbert_data_file = os.path.join(args.output_dir, 'distilbert_loaded.json')
+            if not state.get('distilbert_data_loaded') or not os.path.exists(distilbert_data_file):
+                train_texts, train_tags = distilbert_augmenter.load_data(args.data_dir)
+                try:
+                    with open(distilbert_data_file, 'w', encoding='utf-8') as df:
+                        json.dump({'texts': train_texts, 'tags': train_tags}, df, ensure_ascii=False)
+                    state['distilbert_data_loaded'] = True
+                    save_state(state)
+                    logger.info('Datos DistilBERT cargados y guardados en checkpoint: %s', distilbert_data_file)
+                except Exception:
+                    logger.exception('No se pudo guardar checkpoint de datos DistilBERT')
+            else:
+                logger.info('Cargando datos DistilBERT desde checkpoint: %s', distilbert_data_file)
+                with open(distilbert_data_file, 'r', encoding='utf-8') as df:
+                    dd = json.load(df)
+                train_texts = dd.get('texts', [])
+                train_tags = dd.get('tags', [])
+
+            # Aumentar datos (con checkpoint por número de aumentaciones)
+            distilbert_aug_file = os.path.join(args.output_dir, f'distilbert_augmented_{args.num_augmentations}.json')
+            aug_state_key = f'distilbert_augmented_{args.num_augmentations}'
+            if not state.get(aug_state_key) or not os.path.exists(distilbert_aug_file):
+                augmented_texts, augmented_tags = distilbert_augmenter.augment_data(
+                    train_texts, train_tags, num_augmentations=args.num_augmentations
+                )
+                try:
+                    with open(distilbert_aug_file, 'w', encoding='utf-8') as af:
+                        json.dump({'texts': augmented_texts, 'tags': augmented_tags}, af, ensure_ascii=False)
+                    state[aug_state_key] = True
+                    save_state(state)
+                    logger.info('Datos aumentados DistilBERT guardados en checkpoint: %s', distilbert_aug_file)
+                except Exception:
+                    logger.exception('No se pudo guardar checkpoint de datos aumentados DistilBERT')
+            else:
+                logger.info('Cargando datos aumentados DistilBERT desde checkpoint: %s', distilbert_aug_file)
+                with open(distilbert_aug_file, 'r', encoding='utf-8') as af:
+                    ad = json.load(af)
+                augmented_texts = ad.get('texts', [])
+                augmented_tags = ad.get('tags', [])
             
             # Entrenar modelo (paso: distilbert train)
             if not state.get('distilbert_trained'):
@@ -303,13 +336,62 @@ def main():
             # Inicializar spaCy
             spacy_augmenter.initialize_spacy()
             
-            # Cargar datos
-            spacy_data = spacy_augmenter.load_data(args.data_dir)
-            
-            # Aumentar datos
-            augmented_data = spacy_augmenter.augment_data(
-                spacy_data, num_augmentations=args.num_augmentations
-            )
+            # Cargar datos (con checkpoint)
+            spacy_data_file = os.path.join(args.output_dir, 'spacy_loaded.json')
+            if not state.get('spacy_data_loaded') or not os.path.exists(spacy_data_file):
+                spacy_data = spacy_augmenter.load_data(args.data_dir)
+                # serializar a formato JSON-friendly
+                serial = []
+                for text, ann in spacy_data:
+                    ents = ann.get('entities', []) if isinstance(ann, dict) else []
+                    serial.append({'text': text, 'entities': [[e[0], e[1], e[2]] for e in ents]})
+                try:
+                    with open(spacy_data_file, 'w', encoding='utf-8') as sf:
+                        json.dump(serial, sf, ensure_ascii=False)
+                    state['spacy_data_loaded'] = True
+                    save_state(state)
+                    logger.info('Datos spaCy cargados y guardados en checkpoint: %s', spacy_data_file)
+                except Exception:
+                    logger.exception('No se pudo guardar checkpoint de datos spaCy')
+            else:
+                logger.info('Cargando datos spaCy desde checkpoint: %s', spacy_data_file)
+                with open(spacy_data_file, 'r', encoding='utf-8') as sf:
+                    serial = json.load(sf)
+                spacy_data = []
+                for item in serial:
+                    text = item.get('text', '')
+                    ents = item.get('entities', [])
+                    spacy_data.append((text, {'entities': [tuple(e) for e in ents]}))
+
+            # Aumentar datos (con checkpoint por número de aumentaciones)
+            spacy_aug_file = os.path.join(args.output_dir, f'spacy_augmented_{args.num_augmentations}.json')
+            spacy_aug_key = f'spacy_augmented_{args.num_augmentations}'
+            if not state.get(spacy_aug_key) or not os.path.exists(spacy_aug_file):
+                augmented_data = spacy_augmenter.augment_data(
+                    spacy_data, num_augmentations=args.num_augmentations
+                )
+                # serializar augmented_data
+                serial_aug = []
+                for text, ann in augmented_data:
+                    ents = ann.get('entities', []) if isinstance(ann, dict) else []
+                    serial_aug.append({'text': text, 'entities': [[e[0], e[1], e[2]] for e in ents]})
+                try:
+                    with open(spacy_aug_file, 'w', encoding='utf-8') as sf:
+                        json.dump(serial_aug, sf, ensure_ascii=False)
+                    state[spacy_aug_key] = True
+                    save_state(state)
+                    logger.info('Datos aumentados spaCy guardados en checkpoint: %s', spacy_aug_file)
+                except Exception:
+                    logger.exception('No se pudo guardar checkpoint de datos aumentados spaCy')
+            else:
+                logger.info('Cargando datos aumentados spaCy desde checkpoint: %s', spacy_aug_file)
+                with open(spacy_aug_file, 'r', encoding='utf-8') as sf:
+                    serial_aug = json.load(sf)
+                augmented_data = []
+                for item in serial_aug:
+                    text = item.get('text', '')
+                    ents = item.get('entities', [])
+                    augmented_data.append((text, {'entities': [tuple(e) for e in ents]}))
             
             # Entrenar modelo (paso: spacy train)
             if not state.get('spacy_trained'):

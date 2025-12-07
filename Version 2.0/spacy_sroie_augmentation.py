@@ -222,7 +222,7 @@ class SROIESpacyAugmenter:
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
         text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
-        text_files = text_files[:5] #para realizar pruebas con pocos archivos
+        #text_files = text_files[:5] #para realizar pruebas con pocos archivos
 
         for text_file in text_files:
             # Cargar texto

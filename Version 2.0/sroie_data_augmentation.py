@@ -162,6 +162,42 @@ class SROIEDataAugmenter:
         translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
         return translated_text
+
+    def batch_translate(self, texts: List[str], source_lang: str, target_lang: str, batch_size: int = 8) -> List[str]:
+        """
+        Traduce una lista de textos en batch para mejorar rendimiento.
+
+        Args:
+            texts: Lista de textos a traducir.
+            source_lang: Idioma fuente.
+            target_lang: Idioma objetivo.
+            batch_size: Tamaño de lote para la traducción.
+
+        Returns:
+            Lista de textos traducidos en el mismo orden.
+        """
+        if not texts:
+            return []
+
+        model_key = f'{source_lang}-{target_lang}'
+        if model_key not in self.translation_models:
+            raise ValueError(f"Modelo de traducción {model_key} no cargado.")
+
+        tokenizer = self.translation_models[model_key]['tokenizer']
+        model = self.translation_models[model_key]['model']
+
+        max_len = getattr(tokenizer, 'model_max_length', None) or 512
+        results = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            # Tokenizar en batch
+            inputs = tokenizer(batch, return_tensors='pt', padding=True, truncation=True, max_length=max_len).to(self.device)
+            outputs = model.generate(**inputs)
+            decoded = [tokenizer.decode(o, skip_special_tokens=True) for o in outputs]
+            results.extend(decoded)
+
+        return results
     
     def back_translate(self, text: str, entities: Entities, 
                        source_lang: str = 'es', target_lang: str = 'en') -> Tuple[str, Entities]:
@@ -228,34 +264,29 @@ class SROIEDataAugmenter:
             if not combined_segments:
                 combined_segments = [masked_text]
             
-            # Procesar cada segmento
+            # Procesar cada segmento usando traducción por lotes cuando sea posible
             translated_parts = []
-            for segment in combined_segments:
+            # Primero, procesar segmentos que quepan en max_len y preparar chunks para los muy largos
+            small_segments = []
+            small_indices = []
+            large_segment_chunks = []  # list of lists (chunks per segment)
+
+            for seg_idx, segment in enumerate(combined_segments):
                 if not segment.strip():
                     continue
-                
                 segment_tokens = len(tokenizer_src_tgt.encode(segment, add_special_tokens=True))
-                
                 if segment_tokens <= max_len:
-                    # Segmento cabe, traducir normalmente
-                    try:
-                        trans_segment = self.translate(segment, source_lang, target_lang)
-                        back_segment = self.translate(trans_segment, target_lang, source_lang)
-                        translated_parts.append(back_segment)
-                    except Exception as e:
-                        logger.warning("Error traduciendo segmento de %d tokens: %s. Omitiendo traducción.", segment_tokens, e)
-                        translated_parts.append(segment)
+                    small_segments.append(segment)
+                    small_indices.append(seg_idx)
                 else:
-                    # Segmento muy largo, dividir por palabras
-                    logger.debug("Segmento aún muy largo (%d tokens). Dividiendo por palabras.", segment_tokens)
+                    # Dividir por palabras en chunks para el segmento grande
                     words = segment.split()
                     word_chunks = []
                     current_chunk = []
                     current_len = 0
-                    
                     for word in words:
                         word_token_len = len(tokenizer_src_tgt.encode(word, add_special_tokens=False))
-                        if current_len + word_token_len < max_len - 50:  # Margen de seguridad
+                        if current_len + word_token_len < max_len - 50:
                             current_chunk.append(word)
                             current_len += word_token_len
                         else:
@@ -263,20 +294,56 @@ class SROIEDataAugmenter:
                                 word_chunks.append(' '.join(current_chunk))
                             current_chunk = [word]
                             current_len = word_token_len
-                    
                     if current_chunk:
                         word_chunks.append(' '.join(current_chunk))
-                    
-                    # Traducir cada chunk de palabras
-                    for chunk in word_chunks:
+                    large_segment_chunks.append((seg_idx, word_chunks))
+
+            # Traducir small_segments en batch si hay alguna
+            if small_segments:
+                try:
+                    trans_small = self.batch_translate(small_segments, source_lang, target_lang)
+                    back_small = self.batch_translate(trans_small, target_lang, source_lang)
+                except Exception as e:
+                    logger.warning("Batch translation failed for small segments: %s. Falling back to single translate.", e)
+                    back_small = []
+                    for s in small_segments:
                         try:
-                            trans_chunk = self.translate(chunk, source_lang, target_lang)
-                            back_chunk = self.translate(trans_chunk, target_lang, source_lang)
-                            translated_parts.append(back_chunk)
-                        except Exception as e:
-                            logger.warning("Error traduciendo chunk: %s. Omitiendo traducción.", e)
-                            translated_parts.append(chunk)
-            
+                            t = self.translate(s, source_lang, target_lang)
+                            bt = self.translate(t, target_lang, source_lang)
+                            back_small.append(bt)
+                        except Exception:
+                            back_small.append(s)
+
+                # Place back_small results into translated_parts at appropriate indices
+                # Initialize translated_parts with empty strings same length as combined_segments
+            translated_parts = [''] * len(combined_segments)
+            for idx, seg_idx in enumerate(small_indices):
+                translated_parts[seg_idx] = back_small[idx]
+
+            # Procesar los segmentos grandes por chunks y traducir cada chunk en batch
+            for seg_idx, chunks in large_segment_chunks:
+                back_chunks = []
+                try:
+                    trans_chunks = self.batch_translate(chunks, source_lang, target_lang)
+                    back_chunks = self.batch_translate(trans_chunks, target_lang, source_lang)
+                except Exception as e:
+                    logger.warning("Batch translation failed for large segment chunks: %s. Falling back to single translate.", e)
+                    back_chunks = []
+                    for c in chunks:
+                        try:
+                            t = self.translate(c, source_lang, target_lang)
+                            bt = self.translate(t, target_lang, source_lang)
+                            back_chunks.append(bt)
+                        except Exception:
+                            back_chunks.append(c)
+
+                translated_parts[seg_idx] = ' '.join(back_chunks)
+
+            # Reemplazar cualquier segmento vacío por su original limpio
+            for i, part in enumerate(translated_parts):
+                if not part:
+                    translated_parts[i] = combined_segments[i]
+
             back_translated_text = ' '.join(translated_parts)
         
         # Reinsertar las entidades originales y recalcular posiciones
@@ -547,7 +614,7 @@ class SROIEDataAugmenter:
                                    techniques: List[str] = None,
                                    num_augmentations: int = 2,
                                    use_parallel: bool = False,
-                                   use_threads: bool = False,
+                                   use_threads: bool = True,
                                    num_workers: int = 4) -> Tuple[List[str], List[Entities]]:
         """
         Genera datos sintéticos aplicando técnicas de aumentación.
@@ -558,7 +625,8 @@ class SROIEDataAugmenter:
             techniques: Lista de técnicas a aplicar. Si es None, se seleccionan aleatoriamente.
             num_augmentations: Número de versiones aumentadas a generar por texto.
             use_parallel: Si se debe usar multiprocessing para paralelizar.
-            num_workers: Número de procesos paralelos (si use_parallel=True).
+            use_threads: Si se debe usar hilos (ThreadPool) para compartir modelos entre workers.
+            num_workers: Número de procesos/hilos paralelos.
             
         Returns:
             Tuple con listas de textos y entidades aumentados.
@@ -679,21 +747,26 @@ class SROIEDataAugmenter:
                         synthetic_texts.append(aug_text)
                         synthetic_entities.append(aug_entities)
         else:
-            # Versión secuencial (original)
+            # Versión secuencial (original) - optimizada en logging
+            total_tasks = len(texts) * max(1, num_augmentations)
+            log_step = max(1, total_tasks // 20)
+            task_counter = 0
             for i, (text, entities) in enumerate(zip(texts, all_entities)):
-                logger.info("Generando datos sintéticos para texto %d/%d...", i+1, len(texts))
-                
                 for j in range(num_augmentations):
                     # Seleccionar técnica
                     technique = random.choice(techniques)
-                    
+
                     # Aplicar técnica
                     aug_text, aug_entities = self.apply_combined_augmentation(
                         text, entities, entity_pool, technique
                     )
-                    
+
                     synthetic_texts.append(aug_text)
                     synthetic_entities.append(aug_entities)
+
+                    task_counter += 1
+                    if task_counter % log_step == 0 or task_counter == total_tasks:
+                        logger.info("Progreso secuencial: %d/%d (%.1f%%)", task_counter, total_tasks, task_counter * 100.0 / total_tasks)
         
         return synthetic_texts, synthetic_entities
     
