@@ -262,7 +262,7 @@ class SROIEDistilBERTAugmenter:
         data_dir_texto = data_dir+"\\box"
         data_dir_tag = data_dir+"\\entities"
         text_files = [f for f in os.listdir(data_dir_texto) if f.endswith('.txt')]
-        text_files = text_files[:5] #para realizar pruebas con pocos archivos
+        #text_files = text_files[:5] #para realizar pruebas con pocos archivos
         
         for text_file in text_files:
             # Cargar texto
@@ -451,16 +451,9 @@ class SROIEDistilBERTAugmenter:
         
         val_dataset = SROIEDataset(val_texts, val_tags, self.tokenizer)
         
-        # Crear dataloaders sin paralelismo (num_workers=0) para evitar overhead de memoria
-        # El paralelismo con DataLoader puede causar MemoryError en máquinas con poca RAM
-        train_dataloader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=0, pin_memory=False
-        )
-        val_dataloader = DataLoader(
-            val_dataset, batch_size=batch_size,
-            num_workers=0, pin_memory=False
-        )
+        # Crear dataloaders
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
         
         # Cargar modelo
         num_labels = len(train_dataset.tag2id)
@@ -468,7 +461,7 @@ class SROIEDistilBERTAugmenter:
             self.load_model(num_labels)
         
         # Entrenamiento sin paralelismo para evitar overhead de memoria
-        logger.info("Entrenamiento sin paralelismo (num_workers=0, sin DataParallel)")
+        logger.info("Entrenamiento del modelo")
 
         # Configurar optimizador
         optimizer = AdamW(self.model.parameters(), lr=learning_rate)
@@ -477,7 +470,7 @@ class SROIEDistilBERTAugmenter:
         total_steps = len(train_dataloader) * num_epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=0,
+            num_warmup_steps=1,
             num_training_steps=total_steps
         )
         
@@ -522,17 +515,13 @@ class SROIEDistilBERTAugmenter:
             'val_f1': []
         }
         
-        # Parámetros para gradient accumulation
-        accumulation_steps = 2
-        accumulated_loss = 0
-
         # Entrenamiento
         for epoch in range(num_epochs):
             # Modo entrenamiento
             self.model.train()
             total_train_loss = 0
             
-            for batch_idx, batch in enumerate(train_dataloader):
+            for batch in train_dataloader:
                 # Mover batch al dispositivo
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
@@ -554,22 +543,15 @@ class SROIEDistilBERTAugmenter:
                 else:
                     loss = outputs.loss
                 
-                # Normalizar pérdida por número de pasos de acumulación
-                loss = loss / accumulation_steps
-                
                 # Backward pass
                 loss.backward()
-                accumulated_loss += loss.item()
                 
-                # Actualizar parámetros cada accumulation_steps batches
-                if (batch_idx + 1) % accumulation_steps == 0:
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    total_train_loss += accumulated_loss
-                    accumulated_loss = 0
-                else:
-                    total_train_loss += loss.item()
+                # Actualizar parámetros
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                
+                total_train_loss += loss.item()
             
             # Calcular pérdida promedio de entrenamiento
             avg_train_loss = total_train_loss / len(train_dataloader)
@@ -618,7 +600,7 @@ class SROIEDistilBERTAugmenter:
             
             # Calcular métricas
             val_precision, val_recall, val_f1, _ = precision_recall_fscore_support(
-                val_true_labels, val_predictions, average='weighted', zero_division=0
+                val_true_labels, val_predictions, average='weighted'
             )
             
             # Calcular pérdida promedio de validación
@@ -652,12 +634,7 @@ class SROIEDistilBERTAugmenter:
                     break
         
         # Cargar el mejor modelo
-        state_dict = torch.load(best_model_path)
-        # Si se usó DataParallel, ajustar las claves del state_dict
-        if torch.cuda.device_count() > 1 and isinstance(self.model, torch.nn.DataParallel):
-            # Las claves de DataParallel tienen prefijo 'module.', removerlo
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        self.model.load_state_dict(state_dict)
+        self.model.load_state_dict(torch.load(best_model_path))
         
         return metrics
     
