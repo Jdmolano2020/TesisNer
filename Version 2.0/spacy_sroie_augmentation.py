@@ -465,7 +465,7 @@ class SROIESpacyAugmenter:
     
     def train_model(self, spacy_data: List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]],
                    n_iter: int = 100, batch_size: int = 16,
-                   dropout: float = 0.2, use_cross_validation: bool = True,
+                   dropout: float = 0.35, use_cross_validation: bool = True,
                    model_dir: str = './models') -> Dict[str, Any]:
         """
         Entrena el modelo spaCy con los datos aumentados.
@@ -484,150 +484,142 @@ class SROIESpacyAugmenter:
         if self.nlp is None:
             self.initialize_spacy()
         
-        # PASO CRUCIAL: Validar y reparar datos de entrenamiento antes de usarlos
-        logger.info("Validando y reparando alineamiento de entidades...")
-        spacy_data, repair_stats = self.validate_and_repair_training_data(spacy_data, remove_invalid=True)
-        
-        logger.info(f"Después de reparación: {len(spacy_data)} ejemplos listos para entrenamiento")
-        
+        # Validación y reparación previa (igual que antes)
+        spacy_data, repair_stats = self.validate_and_repair_training_data(
+            spacy_data, remove_invalid=True
+        )
         if len(spacy_data) == 0:
-            logger.error("No hay datos válidos para entrenar después de reparación")
+            logger.error("Sin datos válidos tras reparación")
             return {}
         
-        # Crear directorio para modelos si no existe
         os.makedirs(model_dir, exist_ok=True)
-        
-        # Crear patrones para el EntityRuler (puede ser vacío si no hay entidades)
         patterns = self.create_entity_patterns(spacy_data)
-        # Añadir EntityRuler y sus patrones (solo si hay patrones válidos)
         if patterns:
             self.add_entity_patterns(patterns)
-        else:
-            logger.info("Sin patrones EntityRuler (datos pueden estar vacíos de entidades)")
-
-        # Asegurarnos de que el componente NER exista
+        
         if "ner" not in self.nlp.pipe_names:
-            # Si entity_ruler existe, agregar NER después de él
-            if "entity_ruler" in self.nlp.pipe_names:
-                self.ner = self.nlp.add_pipe("ner", after="entity_ruler")
-            else:
-                self.ner = self.nlp.add_pipe("ner")
+            last_pipe = self.nlp.pipe_names[-1] if self.nlp.pipe_names else None
+            self.ner = self.nlp.add_pipe("ner", last=True) if not last_pipe \
+                    else self.nlp.add_pipe("ner", after=last_pipe)
         else:
             self.ner = self.nlp.get_pipe("ner")
-
-        # Agregar etiquetas al componente NER
+        
         for _, annotations in spacy_data:
             for _, _, label in annotations["entities"]:
-                try:
-                    self.ner.add_label(label)
-                except Exception:
-                    pass
+                self.ner.add_label(label)
         
-        # Métricas de entrenamiento
-        metrics = {
-            'train_loss': [],
-            'val_precision': [],
-            'val_recall': [],
-            'val_f1': []
-        }
+        metrics = {'train_loss': [], 'val_precision': [], 'val_recall': [], 'val_f1': []}
         
         if use_cross_validation:
-            # Implementar validación cruzada
             kf = KFold(n_splits=5, shuffle=True, random_state=42)
-            cv_results = []
-            cv_results_details = []  # mantener paths de los mejores modelos por fold
-            
-            # Convertir datos a formato de lista para KFold
             data_indices = list(range(len(spacy_data)))
+            cv_results = []
+            
+            # ── CLAVE: ruta del modelo "base" que se actualiza entre folds ──────
+            # Fold 0: arranca desde self.nlp (blank)
+            # Fold 1: arranca desde el mejor modelo del Fold 0
+            # Fold 2: arranca desde el mejor modelo del Fold 1
+            # ...así cada fold hereda el conocimiento del anterior
+            
+            base_model_dir = os.path.join(model_dir, "fold_base")
+            
+            # Guardar el modelo inicial (blank con labels) como punto de partida
+            self.nlp.to_disk(base_model_dir)
             
             for fold, (train_idx, val_idx) in enumerate(kf.split(data_indices)):
-                logger.info("Entrenando fold %d/5...", fold+1)
+                logger.info("═══ Fold %d/5 ═══", fold + 1)
                 
-                # Obtener datos de entrenamiento y validación para este fold
-                fold_train_data = [spacy_data[i] for i in train_idx]
-                fold_val_data = [spacy_data[i] for i in val_idx]
+                fold_train = [spacy_data[i] for i in train_idx]
+                fold_val   = [spacy_data[i] for i in val_idx]
                 
-                # Reiniciar el modelo para este fold
-                fold_nlp = spacy.blank(self.nlp.lang)
-                # Añadir EntityRuler solo si hay patrones
-                if patterns:
-                    if "entity_ruler" not in fold_nlp.pipe_names:
-                        fold_nlp.add_pipe("entity_ruler")
-                    fold_entity_ruler = fold_nlp.get_pipe("entity_ruler")
-                    fold_entity_ruler.add_patterns(patterns)
-                
-                # Añadir NER (después del EntityRuler si existe, sino al inicio)
-                if "ner" not in fold_nlp.pipe_names:
-                    if "entity_ruler" in fold_nlp.pipe_names:
-                        fold_ner = fold_nlp.add_pipe("ner", after="entity_ruler")
-                    else:
-                        fold_ner = fold_nlp.add_pipe("ner")
-                else:
-                    fold_ner = fold_nlp.get_pipe("ner")
-                
-                # Agregar etiquetas
-                for _, annotations in fold_train_data:
-                    for _, _, label in annotations["entities"]:
-                        fold_ner.add_label(label)
-                
-                # Entrenar (pasar model_dir y nombre del fold para que _train_fold pueda guardar el mejor modelo)
-                fold_metrics = self._train_fold(fold_nlp, fold_train_data, fold_val_data, n_iter, batch_size, dropout,
-                                                model_dir=model_dir, model_name=f"fold_{fold+1}")
-                # Registrar F1 y detalles
-                last_f1 = fold_metrics['val_f1'][-1] if fold_metrics.get('val_f1') else 0.0
-                cv_results.append(last_f1)
-                cv_results_details.append({'best_model_path': fold_metrics.get('best_model_path'), 'best_val_f1': fold_metrics.get('best_val_f1', last_f1)})
-            
-            # Calcular F1 promedio de validación cruzada
-            avg_f1 = sum(cv_results) / len(cv_results)
-            logger.info("F1 promedio en validación cruzada: %.4f", avg_f1)
-            
-            # Actualizar métricas
-            metrics['cv_f1'] = avg_f1
-
-            # Seleccionar el mejor modelo entre los folds (si existe)
-            best_fold_model = None
-            try:
-                best_idx = int(np.argmax([d.get('best_val_f1', 0.0) for d in cv_results_details]))
-                best_fold_model = cv_results_details[best_idx].get('best_model_path')
-            except Exception:
-                best_fold_model = None
-
-            if best_fold_model and os.path.exists(best_fold_model):
-                logger.info("Cargando mejor modelo de CV para usar en entrenamiento final: %s", best_fold_model)
+                # ── WARM-START: cargar el mejor modelo del fold anterior ─────────
+                # En lugar de spacy.blank(), cargamos desde el checkpoint previo
                 try:
-                    self.nlp = spacy.load(best_fold_model)
-                except Exception:
-                    logger.info("No se pudo cargar el mejor modelo de CV; se usará el modelo base para el entrenamiento final")
-        
-        # Entrenar modelo final con datos divididos en entrenamiento y evaluación
-        logger.info("Entrenando modelo final con todos los datos...")
-        
-        # Dividir datos en 80% entrenamiento y 20% evaluación
-        split_idx = int(len(spacy_data) * 0.8)
-        final_train_data = spacy_data[:split_idx]
-        final_eval_data = spacy_data[split_idx:]
-        
-        logger.info("Datos de entrenamiento final: %d, Datos de evaluación: %d", len(final_train_data), len(final_eval_data))
-        
-        final_metrics = self._train_fold(self.nlp, final_train_data, final_eval_data, n_iter, batch_size, dropout,
-                                         model_dir=model_dir, model_name="final")
-
-        # Actualizar métricas
-        metrics.update(final_metrics)
-
-        # Si _train_fold guardó un mejor modelo final, cargarlo y guardarlo como 'final_model'
-        best_final = final_metrics.get('best_model_path')
-        if best_final and os.path.exists(best_final):
+                    fold_nlp = spacy.load(base_model_dir)
+                    logger.info("Fold %d: warm-start desde %s", fold + 1, base_model_dir)
+                except Exception as e:
+                    logger.warning("No se pudo cargar warm-start (%s), iniciando desde blank", e)
+                    fold_nlp = spacy.blank(self.nlp.lang)
+                    # Re-añadir NER y labels si arranca desde blank
+                    if "ner" not in fold_nlp.pipe_names:
+                        fold_nlp.add_pipe("ner")
+                    fold_ner = fold_nlp.get_pipe("ner")
+                    for _, ann in fold_train:
+                        for _, _, lbl in ann["entities"]:
+                            fold_ner.add_label(lbl)
+                
+                # Ajustar n_iter para folds posteriores: menos épocas porque
+                # ya viene pre-entrenado (fine-tuning, no entrenamiento desde cero)
+                fold_n_iter = n_iter if fold == 0 else max(int(n_iter * 0.60), 20)
+                
+                logger.info(
+                    "Fold %d: %d train, %d val, %d épocas",
+                    fold + 1, len(fold_train), len(fold_val), fold_n_iter
+                )
+                
+                fold_metrics = self._train_fold(
+                    fold_nlp, fold_train, fold_val,
+                    n_iter=fold_n_iter,
+                    batch_size=batch_size,
+                    dropout=dropout,
+                    model_dir=model_dir,
+                    model_name=f"fold_{fold + 1}"
+                )
+                
+                best_fold_f1 = fold_metrics.get('best_val_f1', 0.0)
+                cv_results.append(best_fold_f1)
+                logger.info("Fold %d completado — Mejor F1: %.4f", fold + 1, best_fold_f1)
+                
+                # ── ACTUALIZAR BASE: el mejor modelo de este fold es el
+                #    punto de partida del siguiente fold (transferencia progresiva)
+                best_fold_path = fold_metrics.get('best_model_path')
+                if best_fold_path and os.path.exists(best_fold_path):
+                    # Solo actualizar la base si este fold mejoró respecto al anterior
+                    prev_best = max(cv_results[:-1]) if len(cv_results) > 1 else 0.0
+                    if best_fold_f1 >= prev_best:
+                        import shutil
+                        if os.path.exists(base_model_dir):
+                            shutil.rmtree(base_model_dir)
+                        shutil.copytree(best_fold_path, base_model_dir)
+                        logger.info(
+                            "Base actualizada con Fold %d (F1=%.4f > prev=%.4f)",
+                            fold + 1, best_fold_f1, prev_best
+                        )
+                    else:
+                        logger.info(
+                            "Base NO actualizada: Fold %d (F1=%.4f) no mejoró prev=%.4f",
+                            fold + 1, best_fold_f1, prev_best
+                        )
+            
+            avg_f1 = sum(cv_results) / len(cv_results)
+            logger.info("F1 promedio CV: %.4f | Por fold: %s", avg_f1, [f"{x:.4f}" for x in cv_results])
+            metrics['cv_f1'] = avg_f1
+            metrics['cv_f1_per_fold'] = cv_results
+            
+            # Para el entrenamiento final, partir del mejor modelo de CV (base_model_dir)
             try:
-                self.nlp = spacy.load(best_final)
+                self.nlp = spacy.load(base_model_dir)
+                logger.info("Entrenamiento final con warm-start del mejor fold")
             except Exception:
-                logger.info("No se pudo cargar best_final; usando self.nlp actual para guardar final_model")
-
-        # Guardar modelo final
-        os.makedirs(model_dir, exist_ok=True)
-        self.nlp.to_disk(os.path.join(model_dir, "final_model"))
+                logger.warning("Usando self.nlp original para entrenamiento final")
         
+        # Entrenamiento final (igual que antes, pero con warm-start)
+        split_idx       = int(len(spacy_data) * 0.8)
+        final_train     = spacy_data[:split_idx]
+        final_eval      = spacy_data[split_idx:]
+        
+        final_metrics = self._train_fold(
+            self.nlp, final_train, final_eval,
+            n_iter=n_iter, batch_size=batch_size, dropout=dropout,
+            model_dir=model_dir, model_name="final"
+        )
+        metrics.update(final_metrics)
+        
+        best_final_path = final_metrics.get('best_model_path')
+        if best_final_path and os.path.exists(best_final_path):
+            self.nlp = spacy.load(best_final_path)
+        
+        self.nlp.to_disk(os.path.join(model_dir, "final_model"))
         return metrics
 
     def _clean_entities(self, entities: List[Tuple[int, int, str]], text_len: Optional[int] = None) -> List[Tuple[int, int, str]]:
@@ -1112,111 +1104,151 @@ class SROIESpacyAugmenter:
         """
         # Métricas de entrenamiento
         fold_metrics = {
-            'train_loss': [],
-            'val_precision': [],
-            'val_recall': [],
-            'val_f1': []
+            'train_loss': [], 'val_precision': [],
+            'val_recall': [], 'val_f1': []
         }
         
-        # Configurar optimizador
         optimizer = nlp.begin_training()
+        best_val_f1      = 0.0
+        best_model_path  = None
         
-        # Variables para early stopping y timing
-        best_val_f1 = 0
-        patience = 5
+        # ── PATIENCE ADAPTATIVO ───────────────────────────────────────────────
+        # Regla: patience = max(épocas_mínimas, n_iter * fracción)
+        # 
+        # Razonamiento:
+        #   - Con n_iter=50:  patience = max(10, 50×0.20) = max(10,10) = 10
+        #   - Con n_iter=100: patience = max(10, 100×0.20) = max(10,20) = 20
+        #   - Con n_iter=200: patience = max(10, 200×0.20) = max(10,40) = 40
+        #
+        # La fracción 0.20 significa: "esperar al menos el 20% del total
+        # de épocas sin mejora antes de parar"
+        
+        MIN_PATIENCE  = 10   # nunca menos de 10 épocas sin mejora
+        PATIENCE_FRAC = 0.20 # 20% de n_iter como mínimo dinámico
+        
+        patience = max(MIN_PATIENCE, int(n_iter * PATIENCE_FRAC))
+        logger.info("patience=%d (n_iter=%d, frac=%.0f%%)",
+                    patience, n_iter, PATIENCE_FRAC * 100)
+        
         patience_counter = 0
-        import time
-        epoch_start_time = time.time()
-        best_model_path = None
         
-        # Entrenar
+        # ── Historial de F1 para detección de plateau real ────────────────────
+        # En lugar de comparar solo contra el máximo histórico (muy estricto),
+        # usar una ventana deslizante para detectar mejora real
+        f1_history    = []
+        WINDOW_SIZE   = 5     # ventana para calcular tendencia
+        MIN_DELTA     = 1e-4  # mejora mínima significativa (0.01%)
+        
+        # ── Cálculo dinámico de compound_factor ───────────────────────────────
+        n_iter_to_max = max(1, int(n_iter * 0.30))
+        if batch_size > 4:
+            import math
+            compound_factor = (batch_size / 4.0) ** (1.0 / n_iter_to_max)
+        else:
+            compound_factor = 1.0
+        
+        import time
+        epoch_start = time.time()
+        
         for epoch in range(n_iter):
-            # Mezclar datos
             random.shuffle(train_data)
             
-            # Crear lotes
-            batches = minibatch(train_data, size=compounding(4.0, batch_size, 1.001))
+            batches = minibatch(
+                train_data,
+                size=compounding(4.0, float(batch_size), compound_factor)
+            )
             
-            # Inicializar pérdida
             losses = {}
-            
-            # Entrenar en lotes con procesamiento paralelo de ejemplos
-            from concurrent.futures import ThreadPoolExecutor
-            def create_example(item):
-                text, annotations = item
-                # # Primero validar y fijar alineación
-                # cleaned_text, aligned_entities = self._validate_and_fix_alignment(text, annotations.get("entities", []))
-                # # Luego limpiar duplicados/solapamientos
-                # final_entities = self._clean_entities(aligned_entities, text_len=len(cleaned_text))
-                # Crear doc con el texto limpiado
-                doc = nlp.make_doc(text)
-                # cleaned_annotations = {"entities": final_entities}
-                try:
-                    example = Example.from_dict(doc, annotations)
-                    return example
-                except Exception as e:
-                    logger.debug("No se pudo crear Example: %s", e)
-                    return None
-            
-            # Entrenar en lotes
             for batch in batches:
-                # Crear ejemplos en paralelo (limitado a 2 threads para no sobrecargar)
                 examples = []
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    results = executor.map(create_example, batch)
-                    examples = [ex for ex in results if ex is not None]
-                
-                # Actualizar modelo
-                nlp.update(examples, drop=dropout, losses=losses)
+                for text, annotations in batch:
+                    doc = nlp.make_doc(text)
+                    try:
+                        examples.append(Example.from_dict(doc, annotations))
+                    except Exception as e:
+                        logger.debug("Ejemplo inválido omitido: %s", e)
+                if examples:
+                    nlp.update(examples, drop=dropout, losses=losses)
             
-            # Registrar pérdida
             fold_metrics['train_loss'].append(losses.get("ner", 0.0))
             
-            # Evaluar en conjunto de validación si está disponible
             if val_data:
-                val_metrics = self.evaluate_model(nlp, val_data)
-                fold_metrics['val_precision'].append(val_metrics['precision'])
-                fold_metrics['val_recall'].append(val_metrics['recall'])
-                fold_metrics['val_f1'].append(val_metrics['f1'])
+                val_m = self.evaluate_model(nlp, val_data)
+                fold_metrics['val_precision'].append(val_m['precision'])
+                fold_metrics['val_recall'].append(val_m['recall'])
+                fold_metrics['val_f1'].append(val_m['f1'])
                 
-                logger.info("Epoch %d/%d", epoch+1, n_iter)
-                logger.info("Train Loss: %.4f", losses.get('ner', 0.0))
-                logger.info("Val Precision: %.4f", val_metrics['precision'])
-                logger.info("Val Recall: %.4f", val_metrics['recall'])
-                logger.info("Val F1: %.4f", val_metrics['f1'])
-                epoch_elapsed = time.time() - epoch_start_time
-                logger.info("Tiempo de época: %.2f segundos", epoch_elapsed)
-                epoch_start_time = time.time()
+                current_f1 = val_m['f1']
+                f1_history.append(current_f1)
                 
-                # Early stopping
-                if val_metrics['f1'] > best_val_f1:
-                    best_val_f1 = val_metrics['f1']
-                    patience_counter = 0
-                    # Guardar el mejor modelo parcial en disco si se proporcionó model_dir
-                    if model_dir and model_name:
-                        try:
-                            os.makedirs(model_dir, exist_ok=True)
-                            best_model_path = os.path.join(model_dir, f"best_model_{model_name}")
-                            nlp.to_disk(best_model_path)
-                            fold_metrics['best_model_path'] = best_model_path
-                            fold_metrics['best_val_f1'] = best_val_f1
-                            logger.info("Mejor modelo guardado: %s (F1=%.4f)", best_model_path, best_val_f1)
-                        except Exception as e:
-                            logger.info("No se pudo guardar el mejor modelo en disco: %s", e)
+                epoch_elapsed = time.time() - epoch_start
+                epoch_start   = time.time()
+                logger.info(
+                    "Epoch %d/%d | Loss=%.4f | P=%.4f R=%.4f F1=%.4f | "
+                    "patience=%d/%d | t=%.1fs",
+                    epoch + 1, n_iter,
+                    losses.get('ner', 0.0),
+                    val_m['precision'], val_m['recall'], current_f1,
+                    patience_counter, patience, epoch_elapsed
+                )
+                
+                # ── CRITERIO DE MEJORA CON VENTANA DESLIZANTE ─────────────────
+                # Comparar promedio de la ventana actual vs. ventana anterior
+                # Esto filtra ruido y detecta tendencias reales
+                
+                if len(f1_history) >= WINDOW_SIZE * 2:
+                    window_current  = f1_history[-WINDOW_SIZE:]
+                    window_previous = f1_history[-WINDOW_SIZE * 2:-WINDOW_SIZE]
+                    avg_current     = sum(window_current)  / WINDOW_SIZE
+                    avg_previous    = sum(window_previous) / WINDOW_SIZE
+                    trend_improving = (avg_current - avg_previous) > MIN_DELTA
                 else:
-                    patience_counter += 1
+                    # En las primeras épocas, usar comparación simple
+                    trend_improving = current_f1 > (best_val_f1 + MIN_DELTA)
+                
+                # Guardar el mejor modelo absoluto (para recuperación)
+                if current_f1 > best_val_f1 + MIN_DELTA:
+                    best_val_f1      = current_f1
+                    patience_counter = 0
+                    
+                    if model_dir and model_name:
+                        os.makedirs(model_dir, exist_ok=True)
+                        best_model_path = os.path.join(
+                            model_dir, f"best_model_{model_name}"
+                        )
+                        nlp.to_disk(best_model_path)
+                        fold_metrics['best_model_path'] = best_model_path
+                        fold_metrics['best_val_f1']     = best_val_f1
+                        logger.info("✓ Mejor F1=%.4f guardado en %s",
+                                    best_val_f1, best_model_path)
+                else:
+                    # Solo incrementar patience si la TENDENCIA tampoco mejora
+                    if not trend_improving:
+                        patience_counter += 1
+                    else:
+                        # La tendencia sigue mejorando aunque el máximo no se rompió
+                        # → reducir patience_counter (recuperación parcial)
+                        patience_counter = max(0, patience_counter - 1)
+                        logger.debug(
+                            "Tendencia positiva, patience reducido a %d",
+                            patience_counter
+                        )
+                    
                     if patience_counter >= patience:
-                        logger.info("Early stopping activado después de %d épocas", epoch+1)
+                        logger.info(
+                            "Early stopping en época %d | "
+                            "Mejor F1=%.4f | sin mejora por %d épocas",
+                            epoch + 1, best_val_f1, patience
+                        )
                         break
             else:
-                logger.info("Epoch %d/%d", epoch+1, n_iter)
-                logger.info("Train Loss: %.4f", losses.get('ner', 0.0))
+                logger.info("Epoch %d/%d | Loss=%.4f",
+                            epoch + 1, n_iter, losses.get('ner', 0.0))
         
-        # Al final, adjuntar info sobre el mejor modelo si no se agregó antes
         if best_model_path and 'best_model_path' not in fold_metrics:
             fold_metrics['best_model_path'] = best_model_path
-            fold_metrics['best_val_f1'] = best_val_f1
-
+            fold_metrics['best_val_f1']     = best_val_f1
+        
         return fold_metrics
     
     def evaluate_model(self, nlp, eval_data):

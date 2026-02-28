@@ -203,8 +203,8 @@ class SROIEDataAugmenter:
 
         return results
     
-    def back_translate(self, text: str, entities: Entities, 
-                       source_lang: str = 'es', target_lang: str = 'en') -> Tuple[str, Entities, List[dict]]:
+    def back_translate(self, text: str, entities: Entities,
+                   source_lang: str = 'en', target_lang: str = 'de') -> Tuple[str, Entities, List[dict]]:
         """
         Implementa back translation con preservación de entidades.
         Para textos largos, los divide en segmentos, aplica BT a cada uno y recombina.
@@ -235,20 +235,15 @@ class SROIEDataAugmenter:
         sorted_entities = sorted(entities, key=lambda e: e[1], reverse=True)
         
         for i, (entity_text, start, end, entity_type) in enumerate(sorted_entities):
-            unique_id = uuid.uuid4().hex[:8]
-            # Usar placeholder ASCII con guiones bajos para máxima robustez
-            mask = f"__ENT_{unique_id}_{entity_type.upper()}__"
-            # Insertar con espacios para evitar fusiones de tokens
-            masked_text = masked_text[:start] + ' ' + mask + ' ' + masked_text[end:]
+            # Máscara corta y estable: ENTX_0, ENTX_1, ...
+            # El prefijo ENTX es suficientemente raro para no aparecer en texto normal
+            mask = f"ENTX{i}"
+            masked_text = masked_text[:start] + mask + masked_text[end:]
             entity_map[mask] = (entity_text, entity_type)
             mask_meta.append({
-                'mask': mask,
-                'entity_text': entity_text,
-                'entity_type': entity_type,
-                'mask_found': False,
-                'matched_method': None,
-                'match_score': None,
-                'replaced_pos': None
+                'mask': mask, 'entity_text': entity_text,
+                'entity_type': entity_type, 'mask_found': False,
+                'matched_method': None
             })
         
         # Verificar si el texto cabe en el modelo
