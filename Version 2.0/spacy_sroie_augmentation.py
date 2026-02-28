@@ -7,6 +7,7 @@ aumentación de datos en la solución basada en spaCy para el dataset SROIE.
 
 import os
 import random
+import warnings
 import numpy as np
 import pandas as pd
 import spacy
@@ -22,6 +23,10 @@ import unicodedata
 from difflib import SequenceMatcher
 import matplotlib.pyplot as plt
 from datetime import datetime
+import time
+
+# Suprimir warning W036 de spaCy (entity_ruler sin patrones - es solo informativo)
+warnings.filterwarnings("ignore", message=".*W036.*")
 
 # Importar el aumentador de datos
 from sroie_data_augmentation import SROIEDataAugmenter, Entity, Entities
@@ -192,10 +197,16 @@ class SROIESpacyAugmenter:
     def add_entity_patterns(self, patterns: List[Dict]):
         """
         Agrega patrones al EntityRuler para mejorar el reconocimiento.
+        Solo agrega el EntityRuler si hay patrones válidos.
         
         Args:
             patterns: Lista de patrones para el EntityRuler.
         """
+        # Si no hay patrones, no agregar el EntityRuler para evitar W036
+        if not patterns:
+            logger.debug("Sin patrones para EntityRuler, saltando agregar reglas bases")
+            return
+        
         # Crear el EntityRuler si no existe (agregar por nombre y obtener el pipe)
         if self.entity_ruler is None:
             if "entity_ruler" not in self.nlp.pipe_names:
@@ -203,13 +214,15 @@ class SROIESpacyAugmenter:
                 self.nlp.add_pipe("entity_ruler")
             self.entity_ruler = self.nlp.get_pipe("entity_ruler")
 
-        # Añadir patrones
-        self.entity_ruler.add_patterns(patterns)
+        # Añadir patrones (solo si hay patrones válidos)
+        if patterns:
+            self.entity_ruler.add_patterns(patterns)
+            logger.debug(f"Agregados {len(patterns)} patrones al EntityRuler")
     
     def load_data(self, data_dir: str) -> List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]]:
         """
         Carga los datos del dataset SROIE en formato para spaCy.
-        Valida y limpia alineaciones de entidades.
+        Valida y limpia alineaciones de entidades evitando duplicaciones innecesarias.
         
         Args:
             data_dir: Directorio con los archivos del dataset.
@@ -238,21 +251,34 @@ class SROIESpacyAugmenter:
                 with open(os.path.join(data_dir_tag, tag_file), 'r', encoding='utf-8') as f:
                     annotations = json.load(f)
                 
-                # Convertir anotaciones al formato de spaCy
+                # Convertir anotaciones al formato de spaCy (usar tuplas para entidades)
                 entities = []
                 for entity_type, values in annotations.items():
-                    for value in values:
-                        # Buscar la posición de la entidad en el texto
-                        start = text.find(value)
-                        if start != -1:
-                            end = start + len(value)
+                    found_positions = set()  # Rastrear posiciones ya encontradas
+                    value_stripped = values.strip()
+                    if not value_stripped:
+                        continue
+
+                    # Buscar posición en el texto (solo la primera ocurrencia válida)
+                    # Nota: La anotación original ya debería tener la posición correcta
+                    start = text.find(value_stripped)
+
+                    if start != -1:
+                        end = start + len(value_stripped)
+                        # Evitar agregar duplicados exactos
+                        pos_key = (start, end, entity_type)
+                        if pos_key not in found_positions:
                             entities.append((start, end, entity_type))
+                            found_positions.add(pos_key)
+                    else:
+                        logger.debug("Entidad no encontrada en texto: '%s' (tipo=%s, archivo=%s)",
+                                    value_stripped[:50], entity_type, text_file)
                 
-                # Validar y fijar alineación de entidades antes de agregar
-                cleaned_text, valid_entities = self._validate_and_fix_alignment(text, entities)
-                
-                if valid_entities:
-                    spacy_data.append((cleaned_text, {"entities": valid_entities}))
+                # Asegurar que las entidades sean tuplas (List[Tuple[int,int,str]])
+                if entities:
+                    entities = [tuple(ent) for ent in entities]
+                    spacy_data.append((text, {"entities": entities}))
+                    logger.info("Cargado archivo %s con %d entidades válidas", text_file, len(entities))
                 else:
                     logger.warning("Archivo %s no tiene entidades válidas tras limpieza", text_file)
         
@@ -299,87 +325,142 @@ class SROIESpacyAugmenter:
             spacy_entities = []
             for entity_text, start, end, label in entities:
                 spacy_entities.append((start, end, label))
-            
+
             spacy_data.append((text, {"entities": spacy_entities}))
         
         return spacy_data
     
     def augment_data(self, spacy_data: List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]],
-                    num_augmentations: int = 2) -> List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]]:
+                    num_augmentations: int = 2, sample_fraction: float = 1.0,
+                    rejected_dump_path: Optional[str] = None) -> List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]]:
         """
         Aumenta los datos aplicando técnicas de aumentación.
         
         Args:
             spacy_data: Lista de tuplas (texto, anotaciones) en formato spaCy.
             num_augmentations: Número de versiones aumentadas a generar por texto.
+            sample_fraction: Fracción de los datos originales a usar como semilla para generar sintéticos (0.0-1.0).
+            rejected_dump_path: Ruta opcional para volcar ejemplos rechazados (JSONL).
             
         Returns:
             Lista aumentada de tuplas (texto, anotaciones) en formato spaCy.
         """
-        # Convertir datos de spaCy a formato de entidades
-        texts, all_entities = self.convert_spacy_to_entities(spacy_data)
-        
+        # Información inicial
+        total_original = len(spacy_data)
+        sample_fraction = float(sample_fraction) if sample_fraction is not None else 1.0
+        if sample_fraction <= 0 or total_original == 0:
+            logger.warning("spaCy: sample_fraction=%s no es válido o no hay datos; regresando datos originales sin aumentos", str(sample_fraction))
+            return spacy_data
+
+        # Determinar muestra a usar
+        if sample_fraction >= 1.0:
+            seed_data = spacy_data
+            sample_size = total_original
+        else:
+            sample_size = max(1, int(round(total_original * sample_fraction)))
+            # Mantener reproducibilidad
+            random.seed(42)
+            seed_data = random.sample(spacy_data, sample_size)
+
+        logger.info("spaCy: datos cargados=%d, usando muestra=%d (%.1f%%) para generar aumentos (num_augmentations=%d)",
+                    total_original, sample_size, sample_fraction * 100.0, num_augmentations)
+
+        # Convertir datos de spaCy a formato de entidades (usando la muestra)
+        texts, all_entities = self.convert_spacy_to_entities(seed_data)
+
         # Generar datos sintéticos
-        synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+        synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
             texts, all_entities, num_augmentations=num_augmentations,
-            use_parallel=True,use_threads=True, num_workers=6
+            use_parallel=True, use_threads=True, num_workers=6
         )
-        
+        logger.info("spaCy: sintéticos generados=%d (antes del filtrado)", len(synthetic_texts))
+
         # Filtrar datos sintéticos de baja calidad
+        if rejected_dump_path:
+            logger.info("spaCy: los ejemplos rechazados se volcarán en: %s", rejected_dump_path)
         filtered_texts, filtered_entities = self.data_augmenter.filter_synthetic_data(
-            texts, all_entities, synthetic_texts, synthetic_entities
+            texts, all_entities, synthetic_texts, synthetic_entities, synthetic_meta=synthetic_meta, rejected_dump_path=rejected_dump_path
         )
-        
+        logger.info("spaCy: sintéticos conservados tras filtrado=%d", len(filtered_texts))
+
         # Convertir datos sintéticos a formato spaCy
         synthetic_spacy_data = self.convert_entities_to_spacy(filtered_texts, filtered_entities)
-        
+        logger.info("spaCy: registros sintéticos convertidos a formato spaCy=%d", len(synthetic_spacy_data))
+
         # Combinar datos originales y sintéticos
         augmented_spacy_data = spacy_data + synthetic_spacy_data
-        
+        logger.info("spaCy: total registros tras aumentación=%d (originales=%d, sintéticos=%d)",
+                    len(augmented_spacy_data), total_original, len(synthetic_spacy_data))
+
         return augmented_spacy_data
     
     def create_entity_patterns(self, spacy_data: List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]]) -> List[Dict]:
         """
         Crea patrones para el EntityRuler basados en los datos de entrenamiento.
+        Retorna lista vacía si no hay datos o sin entidades.
         
         Args:
             spacy_data: Lista de tuplas (texto, anotaciones) en formato spaCy.
             
         Returns:
-            Lista de patrones para el EntityRuler.
+            Lista de patrones para el EntityRuler (puede estar vacía).
         """
         patterns = []
         entity_examples = {}
         
+        # Validar que hay datos
+        if not spacy_data:
+            logger.debug("Sin datos de entrenamiento para crear patrones EntityRuler")
+            return patterns
+        
         # Recopilar ejemplos de entidades
+        total_entities = 0
         for text, annotations in spacy_data:
-            for start, end, label in annotations["entities"]:
-                entity_text = text[start:end]
-                if label not in entity_examples:
-                    entity_examples[label] = set()
-                entity_examples[label].add(entity_text)
+            entities = annotations.get("entities", [])
+            total_entities += len(entities)
+            
+            for start, end, label in entities:
+                try:
+                    entity_text = text[start:end]
+                    if entity_text and not entity_text.isspace():
+                        if label not in entity_examples:
+                            entity_examples[label] = set()
+                        entity_examples[label].add(entity_text)
+                except Exception as e:
+                    logger.debug(f"Error extrayendo patrón: {e}")
+        
+        if not entity_examples:
+            logger.debug(f"Sin ejemplos de entidades trovados en {len(spacy_data)} muestras (total de ents: {total_entities})")
+            return patterns
         
         # Crear patrones para cada tipo de entidad
+        pattern_count = 0
         for label, examples in entity_examples.items():
             for example in examples:
                 # Patrón exacto
                 patterns.append({"label": label, "pattern": example})
+                pattern_count += 1
                 
                 # Para fechas, agregar patrones de formato
                 if label == "DATE":
                     # Detectar formato de fecha
                     if re.match(r'\d{2}/\d{2}/\d{4}', example):
                         patterns.append({"label": label, "pattern": [{"SHAPE": "dd/dd/dddd"}]})
+                        pattern_count += 1
                     elif re.match(r'\d{2}-\d{2}-\d{4}', example):
                         patterns.append({"label": label, "pattern": [{"SHAPE": "dd-dd-dddd"}]})
+                        pattern_count += 1
                 
                 # Para totales, agregar patrones de formato
                 elif label == "TOTAL":
                     if re.match(r'\$\d+\.\d+', example):
                         patterns.append({"label": label, "pattern": [{"SHAPE": "$d+.d+"}]})
+                        pattern_count += 1
                     elif re.match(r'\d+\.\d+', example):
                         patterns.append({"label": label, "pattern": [{"SHAPE": "d+.d+"}]})
+                        pattern_count += 1
         
+        logger.debug(f"Creados {pattern_count} patrones EntityRuler desde {len(entity_examples)} tipos de entidades")
         return patterns
     
     def train_model(self, spacy_data: List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]],
@@ -403,17 +484,34 @@ class SROIESpacyAugmenter:
         if self.nlp is None:
             self.initialize_spacy()
         
+        # PASO CRUCIAL: Validar y reparar datos de entrenamiento antes de usarlos
+        logger.info("Validando y reparando alineamiento de entidades...")
+        spacy_data, repair_stats = self.validate_and_repair_training_data(spacy_data, remove_invalid=True)
+        
+        logger.info(f"Después de reparación: {len(spacy_data)} ejemplos listos para entrenamiento")
+        
+        if len(spacy_data) == 0:
+            logger.error("No hay datos válidos para entrenar después de reparación")
+            return {}
+        
         # Crear directorio para modelos si no existe
         os.makedirs(model_dir, exist_ok=True)
         
-        # Crear patrones para el EntityRuler
+        # Crear patrones para el EntityRuler (puede ser vacío si no hay entidades)
         patterns = self.create_entity_patterns(spacy_data)
-        # Añadir EntityRuler y sus patrones (se crea si falta)
-        self.add_entity_patterns(patterns)
+        # Añadir EntityRuler y sus patrones (solo si hay patrones válidos)
+        if patterns:
+            self.add_entity_patterns(patterns)
+        else:
+            logger.info("Sin patrones EntityRuler (datos pueden estar vacíos de entidades)")
 
-        # Asegurarnos de que el componente NER exista después del EntityRuler
+        # Asegurarnos de que el componente NER exista
         if "ner" not in self.nlp.pipe_names:
-            self.ner = self.nlp.add_pipe("ner", after="entity_ruler")
+            # Si entity_ruler existe, agregar NER después de él
+            if "entity_ruler" in self.nlp.pipe_names:
+                self.ner = self.nlp.add_pipe("ner", after="entity_ruler")
+            else:
+                self.ner = self.nlp.add_pipe("ner")
         else:
             self.ner = self.nlp.get_pipe("ner")
 
@@ -437,6 +535,7 @@ class SROIESpacyAugmenter:
             # Implementar validación cruzada
             kf = KFold(n_splits=5, shuffle=True, random_state=42)
             cv_results = []
+            cv_results_details = []  # mantener paths de los mejores modelos por fold
             
             # Convertir datos a formato de lista para KFold
             data_indices = list(range(len(spacy_data)))
@@ -450,14 +549,19 @@ class SROIESpacyAugmenter:
                 
                 # Reiniciar el modelo para este fold
                 fold_nlp = spacy.blank(self.nlp.lang)
-                # Añadir EntityRuler por factory name y obtener el pipe
-                if "entity_ruler" not in fold_nlp.pipe_names:
-                    fold_nlp.add_pipe("entity_ruler")
-                fold_entity_ruler = fold_nlp.get_pipe("entity_ruler")
-                fold_entity_ruler.add_patterns(patterns)
-                # Añadir NER después del EntityRuler
+                # Añadir EntityRuler solo si hay patrones
+                if patterns:
+                    if "entity_ruler" not in fold_nlp.pipe_names:
+                        fold_nlp.add_pipe("entity_ruler")
+                    fold_entity_ruler = fold_nlp.get_pipe("entity_ruler")
+                    fold_entity_ruler.add_patterns(patterns)
+                
+                # Añadir NER (después del EntityRuler si existe, sino al inicio)
                 if "ner" not in fold_nlp.pipe_names:
-                    fold_ner = fold_nlp.add_pipe("ner", after="entity_ruler")
+                    if "entity_ruler" in fold_nlp.pipe_names:
+                        fold_ner = fold_nlp.add_pipe("ner", after="entity_ruler")
+                    else:
+                        fold_ner = fold_nlp.add_pipe("ner")
                 else:
                     fold_ner = fold_nlp.get_pipe("ner")
                 
@@ -466,12 +570,13 @@ class SROIESpacyAugmenter:
                     for _, _, label in annotations["entities"]:
                         fold_ner.add_label(label)
                 
-                # Entrenar
-                fold_metrics = self._train_fold(fold_nlp, fold_train_data, fold_val_data, n_iter, batch_size, dropout)
-                cv_results.append(fold_metrics['val_f1'][-1])
-                
-                # Guardar modelo de este fold
-                fold_nlp.to_disk(os.path.join(model_dir, f"model_fold_{fold+1}"))
+                # Entrenar (pasar model_dir y nombre del fold para que _train_fold pueda guardar el mejor modelo)
+                fold_metrics = self._train_fold(fold_nlp, fold_train_data, fold_val_data, n_iter, batch_size, dropout,
+                                                model_dir=model_dir, model_name=f"fold_{fold+1}")
+                # Registrar F1 y detalles
+                last_f1 = fold_metrics['val_f1'][-1] if fold_metrics.get('val_f1') else 0.0
+                cv_results.append(last_f1)
+                cv_results_details.append({'best_model_path': fold_metrics.get('best_model_path'), 'best_val_f1': fold_metrics.get('best_val_f1', last_f1)})
             
             # Calcular F1 promedio de validación cruzada
             avg_f1 = sum(cv_results) / len(cv_results)
@@ -479,6 +584,21 @@ class SROIESpacyAugmenter:
             
             # Actualizar métricas
             metrics['cv_f1'] = avg_f1
+
+            # Seleccionar el mejor modelo entre los folds (si existe)
+            best_fold_model = None
+            try:
+                best_idx = int(np.argmax([d.get('best_val_f1', 0.0) for d in cv_results_details]))
+                best_fold_model = cv_results_details[best_idx].get('best_model_path')
+            except Exception:
+                best_fold_model = None
+
+            if best_fold_model and os.path.exists(best_fold_model):
+                logger.info("Cargando mejor modelo de CV para usar en entrenamiento final: %s", best_fold_model)
+                try:
+                    self.nlp = spacy.load(best_fold_model)
+                except Exception:
+                    logger.info("No se pudo cargar el mejor modelo de CV; se usará el modelo base para el entrenamiento final")
         
         # Entrenar modelo final con datos divididos en entrenamiento y evaluación
         logger.info("Entrenando modelo final con todos los datos...")
@@ -490,12 +610,22 @@ class SROIESpacyAugmenter:
         
         logger.info("Datos de entrenamiento final: %d, Datos de evaluación: %d", len(final_train_data), len(final_eval_data))
         
-        final_metrics = self._train_fold(self.nlp, final_train_data, final_eval_data, n_iter, batch_size, dropout)
-        
+        final_metrics = self._train_fold(self.nlp, final_train_data, final_eval_data, n_iter, batch_size, dropout,
+                                         model_dir=model_dir, model_name="final")
+
         # Actualizar métricas
         metrics.update(final_metrics)
-        
+
+        # Si _train_fold guardó un mejor modelo final, cargarlo y guardarlo como 'final_model'
+        best_final = final_metrics.get('best_model_path')
+        if best_final and os.path.exists(best_final):
+            try:
+                self.nlp = spacy.load(best_final)
+            except Exception:
+                logger.info("No se pudo cargar best_final; usando self.nlp actual para guardar final_model")
+
         # Guardar modelo final
+        os.makedirs(model_dir, exist_ok=True)
         self.nlp.to_disk(os.path.join(model_dir, "final_model"))
         
         return metrics
@@ -515,10 +645,12 @@ class SROIESpacyAugmenter:
         if not entities:
             return []
 
-        # Filtrar spans inválidos y normalizar
+        # Filtrar spans inválidos y normalizar (usar tuplas)
         cleaned = []
         for start, end, label in entities:
             if start is None or end is None:
+                continue
+            if not isinstance(start, int) or not isinstance(end, int):
                 continue
             if start < 0 or end <= start:
                 continue
@@ -550,120 +682,420 @@ class SROIESpacyAugmenter:
 
         return result
 
+    def _deduplicate_and_sort_entities(self, entities: List[Tuple[int, int, str]]) -> List[Tuple[int, int, str]]:
+        """
+        Elimina entidades duplicadas y las ordena por posición de inicio.
+        
+        Args:
+            entities: Lista de tuplas (start, end, label).
+            
+        Returns:
+            Lista de entidades sin duplicados y ordenadas.
+        """
+        if not entities:
+            return []
+        
+        # Eliminar duplicados exactos (misma posición e label)
+        unique_entities = {}
+        for start, end, label in entities:
+            key = (start, end, label)
+            unique_entities[key] = (start, end, label)
+        
+        # Convertir a lista y ordenar por posición de inicio
+        result = list(unique_entities.values())
+        result.sort(key=lambda x: (x[0], x[1]))  # Ordenar por start, luego por end
+        
+        if len(result) < len(entities):
+            logger.debug("_deduplicate_and_sort_entities: eliminados %d duplicados, quedaron %d entidades",
+                        len(entities) - len(result), len(result))
+        
+        return result
+
     def _validate_and_fix_alignment(self, text: str, entities: List[Tuple[int, int, str]]) -> Tuple[str, List[Tuple[int, int, str]]]:
         """
-        Valida y corrige la alineación de entidades usando múltiples estrategias.
-        Normaliza espacios, intenta realinear con char_span, búsqueda exacta y fuzzy.
+        Valida y corrige la alineación de entidades.
+        IMPORTANTE: Trabaja de forma consistente usando solo el texto original.
 
         Args:
             text: Texto original.
+            entities: Lista de tuplas (start, end, label) - índices referidos al texto original.
+
+        Returns:
+            Tuple con (texto_final, entidades_validadas).
+        """
+        # Primero validar todas las entidades contra el texto original
+        initial_valid = []
+        removed_before_truncate = 0
+        
+        for start, end, label in entities:
+            # Validación básica de índices
+            if start is None or end is None or label is None:
+                removed_before_truncate += 1
+                continue
+            
+            if not isinstance(start, int) or not isinstance(end, int):
+                removed_before_truncate += 1
+                continue
+            
+            # Validar rango
+            if start < 0 or end < 0 or start >= end:
+                logger.debug("Entidad inválida (índices negativos o invertidos): [%d:%d] %s", start, end, label)
+                removed_before_truncate += 1
+                continue
+            
+            if start > len(text) or end > len(text):
+                logger.debug("Entidad fuera de rango: [%d:%d] (len=%d) %s", start, end, len(text), label)
+                removed_before_truncate += 1
+                continue
+            
+            # Extraer y validar contenido
+            try:
+                span_text = text[start:end]
+                if not span_text or span_text.isspace():
+                    removed_before_truncate += 1
+                    continue
+                
+                initial_valid.append((start, end, label, span_text))
+            except Exception as e:
+                logger.debug("Error extrayendo span [%d:%d]: %s", start, end, e)
+                removed_before_truncate += 1
+        
+        if removed_before_truncate > 0:
+            logger.info("Removidas %d entidades inválidas en validación inicial", removed_before_truncate)
+        
+        # Normalizar espacios pero MANTENER longitudes iguales donde sea posible
+        cleaned_text = normalize_text(text)
+        
+        # Si la limpieza cambió la longitud, intentar truncar a 512 tokens
+        # max_tokens = 512
+        # nlp_for_tokenization = self.nlp or spacy.blank('es')
+        # doc = nlp_for_tokenization.make_doc(cleaned_text)
+        # tokens = list(doc)
+        
+        # truncated = False
+        # max_char_pos = len(cleaned_text)  # Por defecto, usar todo el texto limpiado
+        
+        # if len(tokens) > max_tokens:
+        #     truncated = True
+        #     tokens = tokens[:max_tokens]
+        #     # Encontrar la posición del último token
+        #     last_token = tokens[-1]
+        #     max_char_pos = last_token.idx + len(last_token.text)
+        #     cleaned_text_truncated = cleaned_text[:max_char_pos].rstrip()
+        #     logger.info("Texto truncado a %d tokens (%d -> %d caracteres)", 
+        #                max_tokens, len(cleaned_text), len(cleaned_text_truncated))
+        #     cleaned_text = cleaned_text_truncated
+        
+        # Filtrar entidades que caben dentro del texto final
+        valid_entities = []
+        removed_after_truncate = 0
+        
+        for start, end, label, span_text in initial_valid:
+            # Verificar que la entidad cabe dentro del texto truncado
+            if end > len(cleaned_text):
+                removed_after_truncate += 1
+                logger.info("Entidad fuera de texto truncado: [%d:%d] vs len=%d", start, end, len(cleaned_text))
+                continue
+            
+            # Verificar que el span aún es correcto en el texto limpiado
+            try:
+                cleaned_span = cleaned_text[start:end]
+                # Hacer una comparación más flexible (ignorando espacios extras)
+                if cleaned_span.strip() and (cleaned_span == span_text or cleaned_span.strip() == span_text.strip()):
+                    valid_entities.append((start, end, label))
+                else:
+                    # El contenido cambió por limpieza - intentar encontrarlo
+                    found = cleaned_text.find(span_text)
+                    if found != -1:
+                        valid_entities.append((found, found + len(span_text), label))
+                        logger.info("Realineada entidad: [%d:%d] -> [%d:%d]", 
+                                   start, end, found, found + len(span_text))
+                    else:
+                        # Búsqueda flexible
+                        span_normalized = span_text.strip()
+                        found = cleaned_text.find(span_normalized)
+                        if found != -1:
+                            valid_entities.append((found, found + len(span_normalized), label))
+                        else:
+                            removed_after_truncate += 1
+                            logger.info("No se pudo realinear: '%s' (label=%s)", span_text[:30], label)
+            except Exception as e:
+                logger.info("Error en validación de entidad: %s", e)
+                removed_after_truncate += 1
+        
+        if removed_after_truncate > 0:
+            logger.info("Removidas %d entidades que no caben en texto truncado", removed_after_truncate)
+        
+        # Eliminar duplicados finales y ordenar
+        if valid_entities:
+            unique_entities = {}
+            for ent in valid_entities:
+                key = (ent[0], ent[1], ent[2])
+                unique_entities[key] = ent
+            valid_entities = sorted(unique_entities.values(), key=lambda x: (x[0], x[1]))
+        
+        return cleaned_text, valid_entities
+
+    def validate_entity_alignment(self, text: str, entities: List[Tuple[int, int, str]]) -> Tuple[bool, List[str]]:
+        """
+        Valida si las entidades están correctamente alineadas con los tokens de spaCy.
+        Usa offsets_to_biluo_tags() para detección rápida y char_span() para
+        comprobación por entidad y diagnóstico.
+
+        Args:
+            text: Texto a validar.
             entities: Lista de tuplas (start, end, label).
 
         Returns:
-            Tuple con (texto_limpiado, entidades_validadas).
+            Tupla (is_valid, issues) donde is_valid es True si todas las entidades
+            están bien alineadas; issues contiene mensajes con cuáles no se alinean.
         """
-        # Normalizar espacios y caracteres especiales
-        cleaned_text = normalize_text(text)
+        from spacy.training import offsets_to_biluo_tags
 
-        valid_entities = []
-        removed_count = 0
-        recovered_count = 0
+        issues: List[str] = []
+
+        # Validaciones básicas
+        if not text or not entities:
+            return True, []
+
+        # Obtener un modelo spaCy para tokenizar
+        try:
+            test_nlp = self.nlp if self.nlp is not None else spacy.blank('es')
+            doc = test_nlp.make_doc(text)
+
+            # Primera aproximación: usar offsets_to_biluo_tags para detectar '-'
+            try:
+                biluo = offsets_to_biluo_tags(doc, entities)
+                misaligned_count = sum(1 for t in biluo if t == '-')
+                if misaligned_count == 0:
+                    return True, []
+                issues.append(f"{misaligned_count} entidades desalineadas (tags '-' encontrados)")
+            except Exception:
+                issues.append("offsets_to_biluo_tags falló; realizando comprobación per-entity")
+
+            # Comprobación por entidad con char_span
+            problematic_entities: List[Tuple[int, int, str]] = []
+            for start, end, label in entities:
+                if start < 0 or end < 0 or start >= end or start > len(text) or end > len(text):
+                    issues.append(f"Índices inválidos: [{start}:{end}] label={label}")
+                    problematic_entities.append((start, end, label))
+                    continue
+
+                span = None
+                for mode in ("contract", "expand"):
+                    try:
+                        span = doc.char_span(start, end, label=label, alignment_mode=mode)
+                        if span is not None:
+                            break
+                    except Exception:
+                        span = None
+
+                if span is None:
+                    original_text = text[start:end]
+                    issues.append(f"Entidad no alineada a tokens: [{start}:{end}] '{original_text}' label={label}")
+                    problematic_entities.append((start, end, label))
+
+            if problematic_entities or misaligned_count:
+                return False, issues
+
+            return True, []
+
+        except Exception as e:
+            issues.append(f"Error general en validación: {str(e)}")
+            return False, issues
+
+    def fix_misaligned_entities(self, text: str, entities: List[Tuple[int, int, str]], 
+                               strict: bool = False) -> List[Tuple[int, int, str]]:
+        """
+        Corrige entidades desalineadas usando offsets_to_biluo_tags() para
+        detección rápida y char_span(alignment_mode) para realizar la corrección.
+
+        Args:
+            text: Texto donde buscar las entidades.
+            entities: Lista de tuplas (start, end, label).
+            strict: Si True, elimina entidades que no se puedan alinear.
+                   Si False, intenta búsquedas y normalizaciones adicionales.
+
+        Returns:
+            Lista de entidades corregidas (alineadas a tokens).
+        """
+        if not entities:
+            return []
+
+        nlp = self.nlp if self.nlp is not None else spacy.blank('es')
+        doc = nlp.make_doc(text)
+
+        # Intento rápido: si offsets_to_biluo_tags no reporta '-', no es necesario corregir
+        try:
+            from spacy.training import offsets_to_biluo_tags
+            biluo = offsets_to_biluo_tags(doc, entities)
+            if not any(t == '-' for t in biluo):
+                return entities
+        except Exception:
+            # Si falla, seguimos al proceso por entidad
+            pass
+
+        fixed: List[Tuple[int, int, str]] = []
 
         for start, end, label in entities:
-            if start is None or end is None or label is None:
-                removed_count += 1
+            # Validación básica
+            if start is None or end is None or start < 0 or end <= start or start > len(text) or end > len(text):
+                logger.info(f"Entidad ignorada (índices inválidos): [{start}:{end}] label={label}")
                 continue
 
-            # Caso 1: Índices inválidos (negativos o fuera de rango)
-            if start < 0 or end > len(text) or start >= end:
-                logger.warning("Entidad inválida (fuera de rango): start=%d, end=%d, len(text)=%d, label=%s. Intentando recuperar por búsqueda...", start, end, len(text), label)
-                
-                # Intentar recuperar la entidad por búsqueda de patrones
-                # (asumiendo que 'start' y 'end' pueden ser erróneos pero 'label' es correcto)
-                # Buscar una entidad de ese tipo que tenga sentido en el contexto
-                
-                # Si tenemos entity_text en la tupla original (raro), usarla
-                # Si no, intentar patrones comunes basados en el label
-                pattern_found = False
-                
-                # Patrones por tipo de entidad
-                patterns = {
-                    'address': r'[\w\s.,#\-\d]{5,}',  # Dirección: al menos 5 caracteres
-                    'company': r'[A-Z][\w\s\.\&\-]{3,}',  # Empresa: comienza con mayúscula
-                    'date': r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',  # Fecha: formato xx/xx/xxxx
-                    'total': r'\$?\d+[\.,]\d{2}',  # Total: número con decimales
-                }
-                
-                pattern = patterns.get(label.lower())
-                if pattern:
-                    import re
-                    matches = list(re.finditer(pattern, text))
-                    if matches:
-                        # Usar el primer match encontrado
-                        match = matches[0]
-                        new_start, new_end = match.start(), match.end()
-                        entity_text = text[new_start:new_end]
-                        valid_entities.append((new_start, new_end, label))
-                        recovered_count += 1
-                        pattern_found = True
-                        logger.debug("Recuperada entidad '%s' (label=%s) por patrón: (%d,%d)", entity_text[:30], label, new_start, new_end)
-                
-                if not pattern_found:
-                    logger.debug("No se pudo recuperar entidad con label=%s por búsqueda de patrones", label)
-                    removed_count += 1
+            original_span = text[start:end]
+            if not original_span or original_span.isspace():
+                logger.info(f"Entidad ignorada (vacía o solo espacios): [{start}:{end}]")
                 continue
 
-            try:
-                entity_text = text[start:end].strip()
+            # Estrategia 1: char_span contract -> expand
+            aligned_span = None
+            for mode in ("contract", "expand"):
+                try:
+                    span = doc.char_span(start, end, label=label, alignment_mode=mode)
+                    if span is not None:
+                        aligned_span = span
+                        logger.info(f"Realineada [{start}:{end}] -> [{span.start_char}:{span.end_char}] usando mode={mode}")
+                        break
+                except Exception:
+                    aligned_span = None
 
-                if not entity_text:
-                    logger.debug("Omitiendo entidad vacía: label=%s", label)
-                    removed_count += 1
-                    continue
+            if aligned_span is not None:
+                fixed.append((aligned_span.start_char, aligned_span.end_char, label))
+                continue
 
-                # Primero intentar alineación avanzada
-                fixed_pos = try_fix_entity_alignment(self.nlp or spacy.blank('es'), text, start, end, label)
-
-                if fixed_pos:
-                    new_start, new_end = fixed_pos
-                    valid_entities.append((new_start, new_end, label))
-                    if (new_start, new_end) != (start, end):
-                        recovered_count += 1
-                        logger.debug("Recuperada entidad '%s' (label=%s): (%d,%d) -> (%d,%d)",
-                                    entity_text[:30], label, start, end, new_start, new_end)
-                    continue
-
-                # Si alineación avanzada falla, intentar búsqueda simple
-                found_pos = cleaned_text.find(entity_text)
-                if found_pos == -1:
-                    entity_normalized = re.sub(r'\s+', ' ', entity_text)
-                    found_pos = cleaned_text.find(entity_normalized)
-
-                if found_pos != -1:
-                    new_start = found_pos
-                    new_end = found_pos + len(entity_text)
-                    if new_start >= 0 and new_end <= len(cleaned_text):
-                        valid_entities.append((new_start, new_end, label))
-                        recovered_count += 1
-                        logger.debug("Realineada entidad '%s' (label=%s): búsqueda", entity_text[:30], label)
+            # Estrategia 2: búsqueda exacta en el texto y alinear la posición encontrada
+            found_pos = text.find(original_span)
+            if found_pos != -1:
+                try:
+                    span = doc.char_span(found_pos, found_pos + len(original_span), label=label, alignment_mode="contract")
+                    if span is not None:
+                        fixed.append((span.start_char, span.end_char, label))
+                        logger.info(f"Realineada por búsqueda exacta: [{start}:{end}] -> [{span.start_char}:{span.end_char}]")
                         continue
+                except Exception:
+                    pass
 
-                # No se pudo alinear
-                logger.debug("No se pudo alinear entidad '%s' (label=%s)", entity_text[:50], label)
-                removed_count += 1
+            # Estrategia 3: normalizar y buscar (si no strict)
+            if not strict:
+                norm = original_span.strip()
+                found_pos = text.find(norm)
+                if found_pos != -1:
+                    try:
+                        span = doc.char_span(found_pos, found_pos + len(norm), label=label, alignment_mode="contract")
+                        if span is not None:
+                            fixed.append((span.start_char, span.end_char, label))
+                            logger.info(f"Realineada por normalización: [{start}:{end}] -> [{span.start_char}:{span.end_char}]")
+                            continue
+                    except Exception:
+                        pass
 
-            except Exception as e:
-                logger.debug("Error al procesar entidad: %s", e)
-                removed_count += 1
+            # Estrategia 4: búsqueda por tokens (subsecuencia) si no strict
+            if not strict:
+                try:
+                    tokens = [t.text for t in doc]
+                    seq = original_span.split()
+                    for i in range(len(tokens) - len(seq) + 1):
+                        window = " ".join(tokens[i:i+len(seq)])
+                        if window == " ".join(seq):
+                            start_char = doc[i].idx
+                            end_char = doc[i+len(seq)-1].idx + len(doc[i+len(seq)-1].text)
+                            span = doc.char_span(start_char, end_char, label=label, alignment_mode="contract")
+                            if span is not None:
+                                fixed.append((span.start_char, span.end_char, label))
+                                break
+                except Exception:
+                    pass
 
-        if removed_count > 0 or recovered_count > 0:
-            logger.info("_validate_and_fix_alignment: %d recuperadas, %d removidas (total: %d)",
-                       recovered_count, removed_count, len(entities))
+            logger.info(f"Entidad descartada (no reparable): [{start}:{end}] '{original_span}' label={label}")
 
+        # Deduplicar y ordenar
+        if fixed:
+            unique = {}
+            for s, e, l in fixed:
+                unique[(s, e, l)] = (s, e, l)
+            fixed = sorted(unique.values(), key=lambda x: (x[0], x[1]))
 
-        return cleaned_text, valid_entities
-    
-    def _train_fold(self, nlp, train_data, val_data, n_iter, batch_size, dropout):
+        logger.info(f"fix_misaligned_entities: {len(entities)} -> {len(fixed)} entidades")
+        return fixed
+
+    def validate_and_repair_training_data(self, spacy_data: List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]],
+                                         remove_invalid: bool = True) -> Tuple[List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]], Dict[str, Any]]:
+        """
+        Valida todos los datos de entrenamiento y repara entidades desalineadas.
+        
+        Args:
+            spacy_data: Lista de tuplas (texto, anotaciones).
+            remove_invalid: Si True, elimina ejemplos que no se pueden reparar.
+            
+        Returns:
+            Tupla (datos_reparados, estadísticas_reparación).
+        """
+        repaired_data = []
+        stats = {
+            'total_samples': len(spacy_data),
+            'valid_without_changes': 0,
+            'repaired': 0,
+            'removed_invalid': 0,
+            'entities_fixed': 0,
+            'entities_removed': 0,
+            'sample_issues': []
+        }
+        
+        for idx, (text, annotations) in enumerate(spacy_data):
+            entities = annotations.get('entities', [])
+            
+            # Validar alineamiento actual
+            is_valid, issues = self.validate_entity_alignment(text, entities)
+            
+            if is_valid:
+                stats['valid_without_changes'] += 1
+                repaired_data.append((text, annotations))
+            else:
+                # Intentar reparar
+                fixed_entities = self.fix_misaligned_entities(text, entities, strict=False)
+                
+                if fixed_entities:
+                    # Verificar que las entidades reparadas son válidas
+                    is_valid_fixed, _ = self.validate_entity_alignment(text, fixed_entities)
+                    
+                    if is_valid_fixed:
+                        stats['repaired'] += 1
+                        stats['entities_fixed'] += len(fixed_entities) - len(entities)
+                        repaired_data.append((text, {'entities': fixed_entities}))
+                    elif remove_invalid:
+                        stats['removed_invalid'] += 1
+                        if len(stats['sample_issues']) < 5:  # Guardar solo 5 ejemplos
+                            stats['sample_issues'].append({
+                                'index': idx,
+                                'text_sample': text[:100],
+                                'issues': issues
+                            })
+                        logger.info(f"inválidos: {issues}")
+                else:
+                    if remove_invalid:
+                        stats['removed_invalid'] += 1
+                        if len(stats['sample_issues']) < 5:
+                            stats['sample_issues'].append({
+                                'index': idx,
+                                'text_sample': text[:100],
+                                'issues': issues
+                            })
+                        logger.info(f"inválidos: {issues}")
+        
+        logger.info(f"Validación de datos de entrenamiento completada:")
+        logger.info(f"  Total: {stats['total_samples']}")
+        logger.info(f"  Válidos sin cambios: {stats['valid_without_changes']}")
+        logger.info(f"  Reparados: {stats['repaired']}")
+        logger.info(f"  Eliminados (inválidos): {stats['removed_invalid']}")
+        if stats['sample_issues']:
+            logger.info(f"  Problemas encontrados (muestra):")
+            for issue in stats['sample_issues']:
+                logger.info(f"    - Índice {issue['index']}: {issue['issues']}")
+        
+        return repaired_data, stats
+
+    def _train_fold(self, nlp, train_data, val_data, n_iter, batch_size, dropout, model_dir: Optional[str] = None, model_name: Optional[str] = None):
         """
         Entrena un fold del modelo.
         
@@ -691,10 +1123,11 @@ class SROIESpacyAugmenter:
         
         # Variables para early stopping y timing
         best_val_f1 = 0
-        patience = 3
+        patience = 5
         patience_counter = 0
         import time
         epoch_start_time = time.time()
+        best_model_path = None
         
         # Entrenar
         for epoch in range(n_iter):
@@ -711,15 +1144,15 @@ class SROIESpacyAugmenter:
             from concurrent.futures import ThreadPoolExecutor
             def create_example(item):
                 text, annotations = item
-                # Primero validar y fijar alineación
-                cleaned_text, aligned_entities = self._validate_and_fix_alignment(text, annotations.get("entities", []))
-                # Luego limpiar duplicados/solapamientos
-                final_entities = self._clean_entities(aligned_entities, text_len=len(cleaned_text))
+                # # Primero validar y fijar alineación
+                # cleaned_text, aligned_entities = self._validate_and_fix_alignment(text, annotations.get("entities", []))
+                # # Luego limpiar duplicados/solapamientos
+                # final_entities = self._clean_entities(aligned_entities, text_len=len(cleaned_text))
                 # Crear doc con el texto limpiado
-                doc = nlp.make_doc(cleaned_text)
-                cleaned_annotations = {"entities": final_entities}
+                doc = nlp.make_doc(text)
+                # cleaned_annotations = {"entities": final_entities}
                 try:
-                    example = Example.from_dict(doc, cleaned_annotations)
+                    example = Example.from_dict(doc, annotations)
                     return example
                 except Exception as e:
                     logger.debug("No se pudo crear Example: %s", e)
@@ -759,6 +1192,17 @@ class SROIESpacyAugmenter:
                 if val_metrics['f1'] > best_val_f1:
                     best_val_f1 = val_metrics['f1']
                     patience_counter = 0
+                    # Guardar el mejor modelo parcial en disco si se proporcionó model_dir
+                    if model_dir and model_name:
+                        try:
+                            os.makedirs(model_dir, exist_ok=True)
+                            best_model_path = os.path.join(model_dir, f"best_model_{model_name}")
+                            nlp.to_disk(best_model_path)
+                            fold_metrics['best_model_path'] = best_model_path
+                            fold_metrics['best_val_f1'] = best_val_f1
+                            logger.info("Mejor modelo guardado: %s (F1=%.4f)", best_model_path, best_val_f1)
+                        except Exception as e:
+                            logger.info("No se pudo guardar el mejor modelo en disco: %s", e)
                 else:
                     patience_counter += 1
                     if patience_counter >= patience:
@@ -768,6 +1212,11 @@ class SROIESpacyAugmenter:
                 logger.info("Epoch %d/%d", epoch+1, n_iter)
                 logger.info("Train Loss: %.4f", losses.get('ner', 0.0))
         
+        # Al final, adjuntar info sobre el mejor modelo si no se agregó antes
+        if best_model_path and 'best_model_path' not in fold_metrics:
+            fold_metrics['best_model_path'] = best_model_path
+            fold_metrics['best_val_f1'] = best_val_f1
+
         return fold_metrics
     
     def evaluate_model(self, nlp, eval_data):
@@ -788,7 +1237,7 @@ class SROIESpacyAugmenter:
         for text, annotations in eval_data:
             # Obtener predicciones
             doc = nlp(text)
-            gold_entities = set([(start, end, label) for start, end, label in annotations["entities"]])
+            gold_entities = set([tuple(ent) for ent in annotations["entities"]])
             pred_entities = set([(e.start_char, e.end_char, e.label_) for e in doc.ents])
             
             # Calcular métricas

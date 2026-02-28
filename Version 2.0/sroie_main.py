@@ -46,6 +46,9 @@ def parse_args():
     
     parser.add_argument('--num_augmentations', type=int, default=2,
                        help='Número de aumentaciones a generar por ejemplo')
+
+    parser.add_argument('--spacy_sample_pct', type=int, default=10,
+                       help='Porcentaje de datos spaCy a usar para generar aumentaciones (ej: 10 para 10%)')
     
     parser.add_argument('--batch_size', type=int, default=16,
                        help='Tamaño del lote para entrenamiento (mayor aprovecha más GPU/paralelismo)')
@@ -340,11 +343,21 @@ def main():
             spacy_data_file = os.path.join(args.output_dir, 'spacy_loaded.json')
             if not state.get('spacy_data_loaded') or not os.path.exists(spacy_data_file):
                 spacy_data = spacy_augmenter.load_data(args.data_dir)
-                # serializar a formato JSON-friendly
+                # serializar a formato JSON-friendly (entidades como dicts explícitos)
                 serial = []
                 for text, ann in spacy_data:
                     ents = ann.get('entities', []) if isinstance(ann, dict) else []
-                    serial.append({'text': text, 'entities': [[e[0], e[1], e[2]] for e in ents]})
+                    ent_objs = []
+                    for e in ents:
+                        # e puede ser (start,end,label) o similar
+                        try:
+                            start, end, label = e[0], e[1], e[2]
+                        except Exception:
+                            # formato inesperado: ignorar el campo de texto
+                            start, end, label = None, None, None
+                        ent_objs.append((start, end, label))
+                    serial.append({'text': text, 'entities': ent_objs})
+
                 try:
                     with open(spacy_data_file, 'w', encoding='utf-8') as sf:
                         json.dump(serial, sf, ensure_ascii=False)
@@ -361,20 +374,52 @@ def main():
                 for item in serial:
                     text = item.get('text', '')
                     ents = item.get('entities', [])
-                    spacy_data.append((text, {'entities': [tuple(e) for e in ents]}))
+                    parsed = []
+                    for ent in ents:
+                        # soportar tanto dicts explícitos como listas/tuplas
+                        if isinstance(ent, dict):
+                            s = ent.get('start')
+                            e = ent.get('end')
+                            lab = ent.get('label')
+                        elif isinstance(ent, (list, tuple)) and len(ent) >= 3:
+                            s, e, lab = ent[0], ent[1], ent[2]
+                        else:
+                            s, e, lab = None, None, None
+                        parsed.append((s, e, lab))
+                    spacy_data.append((text, {'entities': parsed}))
 
-            # Aumentar datos (con checkpoint por número de aumentaciones)
-            spacy_aug_file = os.path.join(args.output_dir, f'spacy_augmented_{args.num_augmentations}.json')
-            spacy_aug_key = f'spacy_augmented_{args.num_augmentations}'
+            # Aumentar datos (con checkpoint por número de aumentaciones y porcentaje de muestra)
+            spacy_aug_file = os.path.join(args.output_dir, f'spacy_augmented_{args.num_augmentations}_samp{args.spacy_sample_pct}.json')
+            spacy_aug_key = f'spacy_augmented_{args.num_augmentations}_samp{args.spacy_sample_pct}'
             if not state.get(spacy_aug_key) or not os.path.exists(spacy_aug_file):
+                # Determinar fracción de muestra para generación (valor seguro entre 0.0 y 1.0)
+                sample_frac = max(0.0, min(1.0, args.spacy_sample_pct / 100.0))
+                total_loaded = len(spacy_data)
+                sample_size = max(1, int(round(total_loaded * sample_frac))) if total_loaded > 0 else 0
+                logger.info("spaCy: datos cargados=%d, spacy_sample_pct=%d%% -> muestra=%d registros para generación de aumentos",
+                            total_loaded, args.spacy_sample_pct, sample_size)
+
+                # Preparar ruta de dump para ejemplos rechazados
+                rejected_dump = os.path.join(args.output_dir, f'spacy_rejected_aug_samp{args.spacy_sample_pct}_n{args.num_augmentations}.jsonl')
+
                 augmented_data = spacy_augmenter.augment_data(
-                    spacy_data, num_augmentations=args.num_augmentations
+                    spacy_data, num_augmentations=args.num_augmentations, sample_fraction=sample_frac,
+                    rejected_dump_path=rejected_dump
                 )
                 # serializar augmented_data
                 serial_aug = []
                 for text, ann in augmented_data:
                     ents = ann.get('entities', []) if isinstance(ann, dict) else []
-                    serial_aug.append({'text': text, 'entities': [[e[0], e[1], e[2]] for e in ents]})
+                    ent_objs = []
+                    for e in ents:
+                        try:
+                            start, end, label = e[0], e[1], e[2]
+                            ent_text = text[start:end] if isinstance(start, int) and isinstance(end, int) and start >= 0 and end <= len(text) else ''
+                        except Exception:
+                            start, end, label = None, None, None
+                            ent_text = ''
+                        ent_objs.append({'text': ent_text, 'start': start, 'end': end, 'label': label})
+                    serial_aug.append({'text': text, 'entities': ent_objs})
                 try:
                     with open(spacy_aug_file, 'w', encoding='utf-8') as sf:
                         json.dump(serial_aug, sf, ensure_ascii=False)
@@ -391,7 +436,18 @@ def main():
                 for item in serial_aug:
                     text = item.get('text', '')
                     ents = item.get('entities', [])
-                    augmented_data.append((text, {'entities': [tuple(e) for e in ents]}))
+                    parsed = []
+                    for ent in ents:
+                        if isinstance(ent, dict):
+                            s = ent.get('start')
+                            e = ent.get('end')
+                            lab = ent.get('label')
+                        elif isinstance(ent, (list, tuple)) and len(ent) >= 3:
+                            s, e, lab = ent[0], ent[1], ent[2]
+                        else:
+                            s, e, lab = None, None, None
+                        parsed.append((s, e, lab))
+                    augmented_data.append((text, {'entities': parsed}))
             
             # Entrenar modelo (paso: spacy train)
             if not state.get('spacy_trained'):

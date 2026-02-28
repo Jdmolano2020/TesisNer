@@ -115,7 +115,7 @@ class SROIEEvaluator:
                         # Generar datos sintéticos según la técnica
                         if technique == "combined":
                             # Usar todas las técnicas
-                            synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+                            synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
                                 self.distilbert_texts, all_entities, 
                                 techniques=["back_translation", "ter", "cwr", 
                                           "back_translation+ter", "back_translation+cwr"],
@@ -123,7 +123,7 @@ class SROIEEvaluator:
                             )
                         else:
                             # Usar técnica específica
-                            synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+                            synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
                                 self.distilbert_texts, all_entities, 
                                 techniques=[technique],
                                 num_augmentations=num_aug
@@ -131,7 +131,7 @@ class SROIEEvaluator:
                         
                         # Filtrar datos sintéticos de baja calidad
                         filtered_texts, filtered_entities = self.data_augmenter.filter_synthetic_data(
-                            self.distilbert_texts, all_entities, synthetic_texts, synthetic_entities
+                            self.distilbert_texts, all_entities, synthetic_texts, synthetic_entities, synthetic_meta=synthetic_meta
                         )
                         
                         # Convertir entidades a etiquetas
@@ -191,7 +191,7 @@ class SROIEEvaluator:
                         # Generar datos sintéticos según la técnica
                         if technique == "combined":
                             # Usar todas las técnicas
-                            synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+                            synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
                                 texts, all_entities, 
                                 techniques=["back_translation", "ter", "cwr", 
                                           "back_translation+ter", "back_translation+cwr"],
@@ -199,7 +199,7 @@ class SROIEEvaluator:
                             )
                         else:
                             # Usar técnica específica
-                            synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+                            synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
                                 texts, all_entities, 
                                 techniques=[technique],
                                 num_augmentations=num_aug
@@ -207,7 +207,7 @@ class SROIEEvaluator:
                         
                         # Filtrar datos sintéticos de baja calidad
                         filtered_texts, filtered_entities = self.data_augmenter.filter_synthetic_data(
-                            texts, all_entities, synthetic_texts, synthetic_entities
+                            texts, all_entities, synthetic_texts, synthetic_entities, synthetic_meta=synthetic_meta
                         )
                         
                         # Convertir datos sintéticos a formato spaCy
@@ -398,7 +398,7 @@ class SROIEEvaluator:
                 # Generar datos sintéticos según la técnica
                 if technique == "combined":
                     # Usar todas las técnicas
-                    synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+                    synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
                         self.distilbert_texts, all_entities, 
                         techniques=["back_translation", "ter", "cwr", 
                                   "back_translation+ter", "back_translation+cwr"],
@@ -406,7 +406,7 @@ class SROIEEvaluator:
                     )
                 else:
                     # Usar técnica específica
-                    synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+                    synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
                         self.distilbert_texts, all_entities, 
                         techniques=[technique],
                         num_augmentations=num_augmentations
@@ -414,7 +414,7 @@ class SROIEEvaluator:
                 
                 # Filtrar datos sintéticos de baja calidad
                 filtered_texts, filtered_entities = self.data_augmenter.filter_synthetic_data(
-                    self.distilbert_texts, all_entities, synthetic_texts, synthetic_entities
+                    self.distilbert_texts, all_entities, synthetic_texts, synthetic_entities, synthetic_meta=synthetic_meta
                 )
                 
                 # Convertir entidades a etiquetas
@@ -456,7 +456,7 @@ class SROIEEvaluator:
                 # Generar datos sintéticos según la técnica
                 if technique == "combined":
                     # Usar todas las técnicas
-                    synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+                    synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
                         texts, all_entities, 
                         techniques=["back_translation", "ter", "cwr", 
                                   "back_translation+ter", "back_translation+cwr"],
@@ -464,7 +464,7 @@ class SROIEEvaluator:
                     )
                 else:
                     # Usar técnica específica
-                    synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+                    synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
                         texts, all_entities, 
                         techniques=[technique],
                         num_augmentations=num_augmentations
@@ -472,7 +472,7 @@ class SROIEEvaluator:
                 
                 # Filtrar datos sintéticos de baja calidad
                 filtered_texts, filtered_entities = self.data_augmenter.filter_synthetic_data(
-                    texts, all_entities, synthetic_texts, synthetic_entities
+                    texts, all_entities, synthetic_texts, synthetic_entities, synthetic_meta=synthetic_meta
                 )
                 
                 # Convertir datos sintéticos a formato spaCy

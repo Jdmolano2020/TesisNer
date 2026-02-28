@@ -392,14 +392,14 @@ class SROIEDistilBERTAugmenter:
         ]
         
         # Generar datos sintéticos
-        synthetic_texts, synthetic_entities = self.data_augmenter.generate_synthetic_data(
+        synthetic_texts, synthetic_entities, synthetic_meta = self.data_augmenter.generate_synthetic_data(
             texts, all_entities, num_augmentations=num_augmentations,
             use_parallel=True,use_threads=True, num_workers=6
         )
         
         # Filtrar datos sintéticos de baja calidad
         filtered_texts, filtered_entities = self.data_augmenter.filter_synthetic_data(
-            texts, all_entities, synthetic_texts, synthetic_entities
+            texts, all_entities, synthetic_texts, synthetic_entities, synthetic_meta=synthetic_meta
         )
         
         # Convertir entidades a etiquetas
@@ -499,7 +499,7 @@ class SROIEDistilBERTAugmenter:
         
         # Variables para early stopping
         best_val_f1 = 0
-        patience = 3
+        patience = 5
         patience_counter = 0
         best_model_path = os.path.join(model_dir, 'best_model.pt')
         

@@ -1,11 +1,14 @@
 {
-    "data_dir": ".\\Data\\sroie\\train",
+    "data_dir": "Data/sroie/completo",
     "output_dir": "./output",
-    "model_type": "both",
+    "model_type": "spacy",
     "technique": "combined",
-    "num_augmentations": 2,
-    "batch_size": 8,
+    "num_augmentations": 3,
+    "spacy_sample_pct": 100,
+    "batch_size": 16,
     "n_iter": 50,
     "evaluate": false,
-    "use_gpu": false
+    "use_gpu": false,
+    "num_workers": 0,
+    "reset_state": false
 }
