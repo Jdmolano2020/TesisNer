@@ -91,7 +91,7 @@ class SROIEDataAugmenter:
         self.bert_model = None
         self.bert_tokenizer = None
         
-    def load_translation_models(self, source_lang: str = 'es', target_lang: str = 'en'):
+    def load_translation_models(self, source_lang: str = 'en', target_lang: str = 'de'):
         """
         Carga los modelos de traducción para back translation.
         
@@ -204,7 +204,7 @@ class SROIEDataAugmenter:
         return results
     
     def back_translate(self, text: str, entities: Entities,
-                   source_lang: str = 'en', target_lang: str = 'de') -> Tuple[str, Entities, List[dict]]:
+                   source_lang: str = 'en', target_lang: str = 'de') -> Tuple[str, Entities, dict]:
         """
         Implementa back translation con preservación de entidades.
         Para textos largos, los divide en segmentos, aplica BT a cada uno y recombina.
@@ -217,7 +217,7 @@ class SROIEDataAugmenter:
             target_lang: Código del idioma objetivo.
             
         Returns:
-            Tuple con el texto traducido, las entidades actualizadas y una lista de dicts con info de máscaras.
+            Tuple con el texto traducido, las entidades actualizadas y un dict con 'success' (bool), 'technique' y 'mask_meta'.
         """
         if not self.translation_models:
             self.load_translation_models(source_lang, target_lang)
@@ -226,7 +226,6 @@ class SROIEDataAugmenter:
         max_len = getattr(tokenizer_src_tgt, 'model_max_length', None) or 512
         
         # Aplicar máscaras robustas a las entidades (ASCII-safe para MT)
-        import uuid
         masked_text = text
         entity_map = {}
         mask_meta = []
@@ -235,10 +234,12 @@ class SROIEDataAugmenter:
         sorted_entities = sorted(entities, key=lambda e: e[1], reverse=True)
         
         for i, (entity_text, start, end, entity_type) in enumerate(sorted_entities):
-            # Máscara corta y estable: ENTX_0, ENTX_1, ...
-            # El prefijo ENTX es suficientemente raro para no aparecer en texto normal
-            mask = f"ENTX{i}"
-            masked_text = masked_text[:start] + mask + masked_text[end:]
+            # Máscara más robusta: rodeada de subrayados y espacios
+            # para aislarla del texto y reducir la probabilidad de ser alterada
+            # por el modelo de traducción. Ej: " __ENTX0__ "
+            mask = f"__ENTX{i}__"
+            # insertar espacios alrededor para evitar que quede pegada a caracteres
+            masked_text = masked_text[:start] + " " + mask + " " + masked_text[end:]
             entity_map[mask] = (entity_text, entity_type)
             mask_meta.append({
                 'mask': mask, 'entity_text': entity_text,
@@ -252,10 +253,14 @@ class SROIEDataAugmenter:
         if tokenized_len <= max_len:
             # Caso 1: Texto pequeño, procesar normalmente
             translated_text = self.translate(masked_text, source_lang, target_lang)
+            # detectar si la traducción comprime el texto
+            try:
+                trans_len = len(tokenizer_src_tgt.encode(translated_text, add_special_tokens=True))
+            except Exception:
+                pass
             back_translated_text = self.translate(translated_text, target_lang, source_lang)
         else:
             # Caso 2: Texto grande, dividir por oraciones/puntos y procesarlo en partes
-            logger.info("Texto demasiado largo (tokens=%d, max=%d). Dividiendo en segmentos para BT...", tokenized_len, max_len)
             
             # Dividir por puntos finales (. ! ?)
             segments = re.split(r'(\.\s+|\!\s+|\?\s+)', masked_text)
@@ -340,7 +345,6 @@ class SROIEDataAugmenter:
                     trans_chunks = self.batch_translate(chunks, source_lang, target_lang)
                     back_chunks = self.batch_translate(trans_chunks, target_lang, source_lang)
                 except Exception as e:
-                    logger.warning("Batch translation failed for large segment chunks: %s. Falling back to single translate.", e)
                     back_chunks = []
                     for c in chunks:
                         try:
@@ -359,9 +363,16 @@ class SROIEDataAugmenter:
 
             back_translated_text = ' '.join(translated_parts)
         
+        # Antes de reinserta las entidades, verificar que el texto no se haya comprimido demasiado
+        if abs(len(back_translated_text) - len(masked_text)) > len(masked_text) * 0.3:
+            # evitar devolver un texto muy comprimido: regresamos la versión original
+            # con entidades intactas para no introducir ejemplos corruptos
+            return text, entities, {'success': False, 'technique': 'back_translation_aborted_short', 'mask_meta': mask_meta}
+
         # Reinsertar las entidades originales y recalcular posiciones
         new_entities = []
-        final_text = back_translated_text
+        # eliminar múltiples espacios que puedan haber surgido al insertar máscaras
+        final_text = re.sub(r"\s+", " ", back_translated_text)
         
         # Buscar las máscaras en el texto traducido y reemplazarlas con estrategias de fallback
         for mask, (entity_text, entity_type) in entity_map.items():
@@ -369,6 +380,7 @@ class SROIEDataAugmenter:
             meta_idx = next((k for k, m in enumerate(mask_meta) if m['mask'] == mask), None)
 
             # 1) Búsqueda exacta
+            # primero tratamos de localizar la máscara tal cual
             idx = final_text.find(mask)
             found_len = len(mask)
             method = None
@@ -378,7 +390,7 @@ class SROIEDataAugmenter:
                 method = 'exact'
                 score = 1.0
 
-            # 2) Si no está, probar búsqueda case-insensitive
+            # 2) búsqueda case-insensitive
             if idx == -1:
                 m = re.search(re.escape(mask), final_text, flags=re.IGNORECASE)
                 if m:
@@ -387,7 +399,18 @@ class SROIEDataAugmenter:
                     method = 'case_insensitive'
                     score = 1.0
 
-            # 3) Fallback fuzzy (SequenceMatcher) buscando la mejor ventana aproximada
+            # 3) patrón con espacios opcionales dentro de la máscara
+            if idx == -1:
+                # por ejemplo "__ENTX0__" -> "__\s*E\s*N\s*T\s*X\s*0\s*__"
+                spaced_pattern = r"".join([re.escape(ch) + r"\s*" for ch in mask])
+                m = re.search(spaced_pattern, final_text, flags=re.IGNORECASE)
+                if m:
+                    idx = m.start()
+                    found_len = m.end() - m.start()
+                    method = 'spaced'
+                    score = 0.9
+
+            # 4) Fallback fuzzy (SequenceMatcher) buscando la mejor ventana aproximada
             if idx == -1:
                 best_ratio = 0.0
                 best_span = None
@@ -400,12 +423,12 @@ class SROIEDataAugmenter:
                     if ratio > best_ratio:
                         best_ratio = ratio
                         best_span = (i, i + len(window))
-                if best_ratio >= 0.65 and best_span is not None:
+                # reducir umbral para ser más permisivo
+                if best_ratio >= 0.5 and best_span is not None:
                     idx = best_span[0]
                     found_len = best_span[1] - best_span[0]
                     method = 'fuzzy'
                     score = best_ratio
-                    logger.debug("Mask fuzzy matched: %s -> ratio=%.2f at pos=%d", mask, best_ratio, idx)
 
             if idx == -1:
                 # Intentar búsqueda directa de la entidad (normalized) como fallback
@@ -418,7 +441,6 @@ class SROIEDataAugmenter:
                     method = 'entity_direct'
                     score = 1.0
                 else:
-                    logger.warning("Mask not found after BT: %s. Entity '%s' may ser perdida. Context start: %s", mask, entity_text, final_text[:200])
                     # Registrar en meta que no se encontró (por ahora)
                     if meta_idx is not None:
                         mask_meta[meta_idx]['mask_found'] = False
@@ -445,7 +467,7 @@ class SROIEDataAugmenter:
 
             if idx == -1:
                 # Si aún no se encontró, continuar (entidad perdida)
-                continue
+                return text, entities, {'success': False, 'technique': 'back_translation_aborted_short', 'mask_meta': mask_meta}
 
             # Reemplazar la porción encontrada por el texto de la entidad original
             final_text = final_text[:idx] + entity_text + final_text[idx + found_len:]
@@ -461,7 +483,7 @@ class SROIEDataAugmenter:
         # Ordenar entidades por posición de inicio
         new_entities = sorted(new_entities, key=lambda e: e[1])
         
-        return final_text, new_entities, mask_meta
+        return final_text, new_entities, {'success': True, 'mask_meta': mask_meta}
     
     def build_entity_pool(self, texts: List[str], all_entities: List[Entities]) -> Dict[str, List[str]]:
         """
@@ -689,7 +711,7 @@ class SROIEDataAugmenter:
 
     def apply_combined_augmentation(self, text: str, entities: Entities,
                                    entity_pool: Dict[str, List[str]],
-                                   technique: str = "random") -> Tuple[str, Entities, Optional[List[dict]]]:
+                                   technique: str = "random") -> Tuple[str, Entities, dict]:
         """
         Aplica una combinación de técnicas de aumentación.
         
@@ -700,7 +722,7 @@ class SROIEDataAugmenter:
             technique: Técnica a aplicar o "random" para selección aleatoria.
             
         Returns:
-            Tuple con el texto aumentado, las entidades actualizadas y metadata opcional (por ejemplo mask info).
+            Tuple con el texto aumentado, las entidades actualizadas y un dict con metadata (incluyendo 'success' para back_translation).
         """        
         if technique == "random":
             technique = random.choice([
@@ -711,11 +733,14 @@ class SROIEDataAugmenter:
         if technique == "back_translation":
             # Si el texto es muy ruidoso (ej: patrones A_A_A), evitar BT y volver con metadata indicando skip
             if self._is_noisy_for_bt(text):
-                logger.info("BT skipped due to noisy input for technique=%s", technique)
-                return text, entities, {'technique': 'back_translation_skipped_noise', 'mask_meta': []}
-            # back_translate returns (text, entities, mask_meta)
+                return text, entities, {'success': False, 'technique': 'back_translation_skipped_noise', 'mask_meta': []}
+            # back_translate returns (text, entities, meta_dict)
             bt_text, bt_entities, bt_meta = self.back_translate(text, entities)
-            return bt_text, bt_entities, {'technique': 'back_translation', 'mask_meta': bt_meta}
+            if not bt_meta.get('success', True):
+                # Si BT falló, aplicar TER como compensación
+                final_text, final_entities = self.apply_ter(text, entities, entity_pool)
+                return final_text, final_entities, {'success': True, 'technique': 'ter_due_to_bt_failure', 'mask_meta': bt_meta['mask_meta']}
+            return bt_text, bt_entities, bt_meta
         
         elif technique == "ter":
             new_text, new_entities = self.apply_ter(text, entities, entity_pool)
@@ -728,30 +753,51 @@ class SROIEDataAugmenter:
         elif technique == "back_translation+ter":
             # Si el texto es ruidoso, hacer TER directamente
             if self._is_noisy_for_bt(text):
-                logger.info("BT skipped due to noisy input, applying TER instead for technique=%s", technique)
                 final_text, final_entities = self.apply_ter(text, entities, entity_pool)
-                return final_text, final_entities, {'technique': 'ter_due_to_bt_noise', 'mask_meta': []}
+                return final_text, final_entities, {'success': True, 'technique': 'ter_due_to_bt_noise', 'mask_meta': []}
             # Aplicar back translation primero
             bt_text, bt_entities, bt_meta = self.back_translate(text, entities)
+            if not bt_meta.get('success', True):
+                # Si BT falló, aplicar solo TER
+                final_text, final_entities = self.apply_ter(text, entities, entity_pool)
+                return final_text, final_entities, {'success': True, 'technique': 'ter_due_to_bt_failure', 'mask_meta': bt_meta['mask_meta']}
             # Luego aplicar TER
             final_text, final_entities = self.apply_ter(bt_text, bt_entities, entity_pool)
-            return final_text, final_entities, {'technique': 'back_translation+ter', 'mask_meta': bt_meta}
+            return final_text, final_entities, {'success': True, 'technique': 'back_translation+ter', 'mask_meta': bt_meta['mask_meta']}
         
         elif technique == "back_translation+cwr":
             # Si el texto es ruidoso, hacer CWR directamente
             if self._is_noisy_for_bt(text):
-                logger.info("BT skipped due to noisy input, applying CWR instead for technique=%s", technique)
                 final_text, final_entities = self.apply_cwr(text, entities)
-                return final_text, final_entities, {'technique': 'cwr_due_to_bt_noise', 'mask_meta': []}
+                return final_text, final_entities, {'success': True, 'technique': 'cwr_due_to_bt_noise', 'mask_meta': []}
             # Aplicar back translation primero
             bt_text, bt_entities, bt_meta = self.back_translate(text, entities)
+            if not bt_meta.get('success', True):
+                # Si BT falló, aplicar solo CWR
+                final_text, final_entities = self.apply_cwr(text, entities)
+                return final_text, final_entities, {'success': True, 'technique': 'cwr_due_to_bt_failure', 'mask_meta': bt_meta['mask_meta']}
             # Luego aplicar CWR
             final_text, final_entities = self.apply_cwr(bt_text, bt_entities)
-            return final_text, final_entities, {'technique': 'back_translation+cwr', 'mask_meta': bt_meta}
+            return final_text, final_entities, {'success': True, 'technique': 'back_translation+cwr', 'mask_meta': bt_meta['mask_meta']}
         
         else:
             raise ValueError(f"Técnica desconocida: {technique}")
     
+    def _ensure_all_entity_labels(self, text: str, entities: Entities,
+                                  entity_pool: Dict[str, List[str]],
+                                  aug_text: str, aug_entities: Entities,
+                                  technique: str) -> Tuple[str, Entities]:
+        """
+        Verifica que el conjunto de tipos de entidad en el ejemplo aumentado
+        coincida con el original. Si no, aplica TER como fallback para mantener
+        el conteo exacto de entidades.
+        """
+        orig_labels = {label for _, _, _, label in entities}
+        syn_labels = {label for _, _, _, label in aug_entities}
+        if orig_labels != syn_labels:
+            aug_text, aug_entities = self.apply_ter(text, entities, entity_pool)
+        return aug_text, aug_entities
+
     def generate_synthetic_data(self, texts: List[str], all_entities: List[Entities],
                                    techniques: List[str] = None,
                                    num_augmentations: int = 2,
@@ -816,6 +862,9 @@ class SROIEDataAugmenter:
                     aug_text, aug_entities, aug_meta = shared_augmenter.apply_combined_augmentation(
                         text, entities, entity_pool, technique
                     )
+                    aug_text, aug_entities = shared_augmenter._ensure_all_entity_labels(
+                        text, entities, entity_pool, aug_text, aug_entities, technique
+                    )
                     return aug_text, aug_entities, aug_meta, task_idx
                 except Exception as e:
                     logger.error("Error en thread worker para tarea %d.%d: %s", task_idx, sub_idx, e)
@@ -873,11 +922,15 @@ class SROIEDataAugmenter:
                     logger.info("Generando datos sintéticos (secuencial) para texto %d/%d...", i+1, len(texts))
                     for j in range(num_augmentations):
                         technique = random.choice(techniques)
-                        aug_text, aug_entities = self.apply_combined_augmentation(
+                        aug_text, aug_entities, aug_meta = self.apply_combined_augmentation(
                             text, entities, entity_pool, technique
+                        )
+                        aug_text, aug_entities = self._ensure_all_entity_labels(
+                            text, entities, entity_pool, aug_text, aug_entities, technique
                         )
                         synthetic_texts.append(aug_text)
                         synthetic_entities.append(aug_entities)
+                        synthetic_meta.append(aug_meta)
 
             except Exception as e:
                 # Capturar otros errores y hacer fallback
@@ -886,11 +939,12 @@ class SROIEDataAugmenter:
                     logger.info("Generando datos sintéticos (secuencial) para texto %d/%d...", i+1, len(texts))
                     for j in range(num_augmentations):
                         technique = random.choice(techniques)
-                        aug_text, aug_entities = self.apply_combined_augmentation(
+                        aug_text, aug_entities, aug_meta = self.apply_combined_augmentation(
                             text, entities, entity_pool, technique
                         )
                         synthetic_texts.append(aug_text)
                         synthetic_entities.append(aug_entities)
+                        synthetic_meta.append(aug_meta)
         else:
             # Versión secuencial (original) - optimizada en logging
             total_tasks = len(texts) * max(1, num_augmentations)
@@ -904,6 +958,9 @@ class SROIEDataAugmenter:
                     # Aplicar técnica
                     aug_text, aug_entities, aug_meta = self.apply_combined_augmentation(
                         text, entities, entity_pool, technique
+                    )
+                    aug_text, aug_entities = self._ensure_all_entity_labels(
+                        text, entities, entity_pool, aug_text, aug_entities, technique
                     )
 
                     synthetic_texts.append(aug_text)
@@ -1009,20 +1066,20 @@ class SROIEDataAugmenter:
             avg_similarity = similarities.mean()
             
             # La diversidad es el complemento de la similitud
-            metrics["diversity"] = 1.0 - avg_similarity
-        except:
+            metrics["diversity"] = float(max(0.0, min(1.0, 1.0 - avg_similarity)))
+        except Exception:
             # En caso de error, asignar un valor predeterminado
             metrics["diversity"] = 0.5
-        
+
         return metrics
-    
+
     def filter_synthetic_data(self, original_texts: List[str], 
                              original_entities: List[Entities],
                              synthetic_texts: List[str], 
                              synthetic_entities: List[Entities],
                              synthetic_meta: Optional[List[dict]] = None,
                              entity_preservation_threshold: float = 0.0,
-                             diversity_threshold: float = 0.22,
+                             diversity_threshold: float = 0.0,
                              rejected_dump_path: Optional[str] = None) -> Tuple[List[str], List[Entities]]:
         """
         Filtra los datos sintéticos de baja calidad.
@@ -1093,6 +1150,58 @@ class SROIEDataAugmenter:
 
             # Reemplazar con la versión limpiada
             syn_entities = clean_syn_entities
+
+            # Intentar recuperar entidades originales perdidas por error de alineación
+            def normalize_string(s: str) -> str:
+                return re.sub(r"\s+", " ", s.strip().lower())
+
+            def find_normalized_substring(text: str, pattern: str) -> Optional[tuple]:
+                text_compact = re.sub(r"\s+", "", text.lower())
+                pattern_compact = re.sub(r"\s+", "", pattern.lower())
+                idx = text_compact.find(pattern_compact)
+                if idx == -1:
+                    return None
+
+                # Mapear índice compacto de regreso a la posición original
+                char_count = 0
+                start = None
+                for pos, ch in enumerate(text):
+                    if ch.isspace():
+                        continue
+                    if char_count == idx:
+                        start = pos
+                        break
+                    char_count += 1
+                if start is None:
+                    return None
+
+                end = start
+                matched = 0
+                while end < len(text) and matched < len(pattern_compact):
+                    if not text[end].isspace():
+                        matched += 1
+                    end += 1
+                return (start, end)
+
+            recovered_entities = []
+            for orig_entity_text, _, _, orig_label in orig_ents:
+                normalized_orig = normalize_string(orig_entity_text)
+                if any(normalize_string(ent_text) == normalized_orig and ent_label == orig_label
+                       for ent_text, _, _, ent_label in syn_entities):
+                    continue
+
+                m = re.search(re.escape(orig_entity_text), syn_text, flags=re.IGNORECASE)
+                if m:
+                    recovered_entities.append((orig_entity_text, m.start(), m.end(), orig_label))
+                else:
+                    # Si no se encuentra con coincidencia exacta, buscar versión normalizada
+                    match_pos = find_normalized_substring(syn_text, orig_entity_text)
+                    if match_pos:
+                        recovered_entities.append((orig_entity_text, match_pos[0], match_pos[1], orig_label))
+
+            if recovered_entities:
+                syn_entities.extend(recovered_entities)
+                syn_entities = sorted(syn_entities, key=lambda e: e[1])
 
             # Evaluar calidad de este ejemplo específico
             example_quality = self.evaluate_synthetic_data_quality(

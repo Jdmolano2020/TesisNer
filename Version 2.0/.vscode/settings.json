@@ -1,0 +1,9 @@
+{
+    "python-envs.pythonProjects": [
+        {
+            "path": "c:\\Users\\HP\\Documents\\Tesis\\Programas\\Ner\\TesisNer\\Version 2.0",
+            "envManager": "ms-python.python:system",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
+}

@@ -364,7 +364,13 @@ class SROIESpacyAugmenter:
 
         logger.info("spaCy: datos cargados=%d, usando muestra=%d (%.1f%%) para generar aumentos (num_augmentations=%d)",
                     total_original, sample_size, sample_fraction * 100.0, num_augmentations)
-
+        # Validación y reparación previa
+        seed_data, repair_stats = self.validate_and_repair_training_data(
+            seed_data, remove_invalid=True
+        )
+        if len(seed_data) == 0:
+            logger.error("Sin datos válidos tras reparación")
+            return {}
         # Convertir datos de spaCy a formato de entidades (usando la muestra)
         texts, all_entities = self.convert_spacy_to_entities(seed_data)
 
@@ -484,7 +490,7 @@ class SROIESpacyAugmenter:
         if self.nlp is None:
             self.initialize_spacy()
         
-        # Validación y reparación previa (igual que antes)
+        # Validación y reparación previa
         spacy_data, repair_stats = self.validate_and_repair_training_data(
             spacy_data, remove_invalid=True
         )
@@ -618,6 +624,12 @@ class SROIESpacyAugmenter:
         best_final_path = final_metrics.get('best_model_path')
         if best_final_path and os.path.exists(best_final_path):
             self.nlp = spacy.load(best_final_path)
+
+        # Agregar post-procesamiento al pipeline final para mejorar entidades DATE/TOTAL.
+        try:
+            self.add_post_processing()
+        except Exception:
+            logger.exception("No se pudo agregar el post-procesamiento spaCy al modelo final")
         
         self.nlp.to_disk(os.path.join(model_dir, "final_model"))
         return metrics
@@ -800,8 +812,6 @@ class SROIESpacyAugmenter:
                     found = cleaned_text.find(span_text)
                     if found != -1:
                         valid_entities.append((found, found + len(span_text), label))
-                        logger.info("Realineada entidad: [%d:%d] -> [%d:%d]", 
-                                   start, end, found, found + len(span_text))
                     else:
                         # Búsqueda flexible
                         span_normalized = span_text.strip()
@@ -810,7 +820,6 @@ class SROIESpacyAugmenter:
                             valid_entities.append((found, found + len(span_normalized), label))
                         else:
                             removed_after_truncate += 1
-                            logger.info("No se pudo realinear: '%s' (label=%s)", span_text[:30], label)
             except Exception as e:
                 logger.info("Error en validación de entidad: %s", e)
                 removed_after_truncate += 1
@@ -932,12 +941,10 @@ class SROIESpacyAugmenter:
         for start, end, label in entities:
             # Validación básica
             if start is None or end is None or start < 0 or end <= start or start > len(text) or end > len(text):
-                logger.info(f"Entidad ignorada (índices inválidos): [{start}:{end}] label={label}")
                 continue
 
             original_span = text[start:end]
             if not original_span or original_span.isspace():
-                logger.info(f"Entidad ignorada (vacía o solo espacios): [{start}:{end}]")
                 continue
 
             # Estrategia 1: char_span contract -> expand
@@ -947,7 +954,6 @@ class SROIESpacyAugmenter:
                     span = doc.char_span(start, end, label=label, alignment_mode=mode)
                     if span is not None:
                         aligned_span = span
-                        logger.info(f"Realineada [{start}:{end}] -> [{span.start_char}:{span.end_char}] usando mode={mode}")
                         break
                 except Exception:
                     aligned_span = None
@@ -963,7 +969,6 @@ class SROIESpacyAugmenter:
                     span = doc.char_span(found_pos, found_pos + len(original_span), label=label, alignment_mode="contract")
                     if span is not None:
                         fixed.append((span.start_char, span.end_char, label))
-                        logger.info(f"Realineada por búsqueda exacta: [{start}:{end}] -> [{span.start_char}:{span.end_char}]")
                         continue
                 except Exception:
                     pass
@@ -977,7 +982,6 @@ class SROIESpacyAugmenter:
                         span = doc.char_span(found_pos, found_pos + len(norm), label=label, alignment_mode="contract")
                         if span is not None:
                             fixed.append((span.start_char, span.end_char, label))
-                            logger.info(f"Realineada por normalización: [{start}:{end}] -> [{span.start_char}:{span.end_char}]")
                             continue
                     except Exception:
                         pass
@@ -999,7 +1003,6 @@ class SROIESpacyAugmenter:
                 except Exception:
                     pass
 
-            logger.info(f"Entidad descartada (no reparable): [{start}:{end}] '{original_span}' label={label}")
 
         # Deduplicar y ordenar
         if fixed:
@@ -1008,7 +1011,6 @@ class SROIESpacyAugmenter:
                 unique[(s, e, l)] = (s, e, l)
             fixed = sorted(unique.values(), key=lambda x: (x[0], x[1]))
 
-        logger.info(f"fix_misaligned_entities: {len(entities)} -> {len(fixed)} entidades")
         return fixed
 
     def validate_and_repair_training_data(self, spacy_data: List[Tuple[str, Dict[str, List[Tuple[int, int, str]]]]],

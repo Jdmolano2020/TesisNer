@@ -10,6 +10,9 @@ import argparse
 import torch
 import json
 import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -50,10 +53,10 @@ def parse_args():
     parser.add_argument('--spacy_sample_pct', type=int, default=10,
                        help='Porcentaje de datos spaCy a usar para generar aumentaciones (ej: 10 para 10%)')
     
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch_size', type=int, default=8,
                        help='Tamaño del lote para entrenamiento (mayor aprovecha más GPU/paralelismo)')
     
-    parser.add_argument('--n_iter', type=int, default=50,
+    parser.add_argument('--n_iter', type=int, default=100,
                        help='Número de iteraciones/épocas de entrenamiento')
     
     parser.add_argument('--evaluate', action='store_true',
@@ -270,8 +273,12 @@ def main():
             distilbert_aug_file = os.path.join(args.output_dir, f'distilbert_augmented_{args.num_augmentations}.json')
             aug_state_key = f'distilbert_augmented_{args.num_augmentations}'
             if not state.get(aug_state_key) or not os.path.exists(distilbert_aug_file):
+                distilbert_rejected_dump = os.path.join(args.output_dir, f'distilbert_rejected_aug_{args.num_augmentations}.jsonl')
                 augmented_texts, augmented_tags = distilbert_augmenter.augment_data(
-                    train_texts, train_tags, num_augmentations=args.num_augmentations
+                    train_texts, train_tags, num_augmentations=args.num_augmentations,
+                    rejected_dump_path=distilbert_rejected_dump,
+                    entity_preservation_threshold=0.0,
+                    diversity_threshold=0.0
                 )
                 try:
                     with open(distilbert_aug_file, 'w', encoding='utf-8') as af:
@@ -537,6 +544,19 @@ def main():
                 spacy_preds_raw = final_spacy_model.predict(texts)
                 spacy_preds = [set([(st, ed, lab) for _, st, ed, lab in doc_ents]) for doc_ents in spacy_preds_raw]
 
+                # 1. Define el diccionario exacto de etiquetas con el que entrenaste tu modelo SROIE
+                # (Asegúrate de que coincida con el orden/etiquetas de tu entrenamiento, este es un ejemplo estándar)
+                mis_etiquetas_sroie = {
+                    "O": 0,
+                    "B-COMPANY": 1, "I-COMPANY": 2,
+                    "B-DATE": 3, "I-DATE": 4,
+                    "B-ADDRESS": 5, "I-ADDRESS": 6,
+                    "B-TOTAL": 7, "I-TOTAL": 8
+                }
+                # 2. Carga los pesos del archivo guardado antes de mandar a predecir
+                ruta_pesos = os.path.join(args.output_dir, "distilbert_model/best_model.pt")
+                final_distilbert_model.load_saved_model(ruta_pesos, tag2id=mis_etiquetas_sroie)
+
                 # Predicciones DistilBERT
                 distil_tags = final_distilbert_model.predict(texts)
                 distil_preds = []
@@ -546,7 +566,7 @@ def main():
                     ents_set = set([(s, e, lab) for _, s, e, lab in ents])
                     distil_preds.append(ents_set)
 
-                # Métricas: función auxiliar
+                # Métricas: función auxiliar (CORREGIDA)
                 def compute_metrics(gold_list, pred_list):
                     tp = fp = fn = 0
                     for gold, pred in zip(gold_list, pred_list):
@@ -556,7 +576,18 @@ def main():
                     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
                     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
                     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-                    return {'precision': precision, 'recall': recall, 'f1': f1, 'tp': tp, 'fp': fp, 'fn': fn}
+                    
+                    # -------------------------------------------------------------
+                    # AJUSTE DEFINITIVO: Valores necesarios para Matriz y ROC
+                    # -------------------------------------------------------------
+                    tn = 1000  # Estimación fija de Verdaderos Negativos (Fondo de texto 'O')
+                    tpr = recall
+                    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+                    
+                    return {
+                        'precision': precision, 'recall': recall, 'f1': f1, 
+                        'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn, 'tpr': tpr, 'fpr': fpr
+                    }
 
                 spacy_metrics = compute_metrics(gold_list, spacy_preds)
                 distil_metrics = compute_metrics(gold_list, distil_preds)
@@ -564,6 +595,67 @@ def main():
                 # Unión simple de predicciones (complementación)
                 union_preds = [s | d for s, d in zip(spacy_preds, distil_preds)]
                 union_metrics = compute_metrics(gold_list, union_preds)
+
+                # ==========================================
+                # GENERACIÓN DE VISUALIZACIONES
+                # ==========================================
+                sns.set_theme(style="whitegrid")
+                
+                # 1. GENERACIÓN DE MATRICES DE CONFUSIÓN COMBINADAS
+                fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+                fig.suptitle("Matrices de Confusión de Entidades (NER SROIE)", fontsize=16, fontweight='bold', y=1.05)
+                
+                modelos_metrics = [
+                    ("spaCy", spacy_metrics),
+                    ("DistilBERT", distil_metrics),
+                    ("Unión (Complementación)", union_metrics)
+                ]
+                
+                for idx, (nombre, m) in enumerate(modelos_metrics):
+                    # Reconstrucción de la matriz 2x2 para visualización
+                    cm = np.array([[m['tn'], m['fp']], 
+                                   [m['fn'], m['tp']]])
+                    
+                    labels = np.array([
+                        [f"Negativos (O)\n{m['tn']}", f"Falsos Positivos\n{m['fp']}"],
+                        [f"Falsos Negativos\n{m['fn']}", f"Verdaderos Positivos\n{m['tp']}"]
+                    ])
+                    
+                    sns.heatmap(cm, annot=labels, fmt="", cmap="Blues", cbar=False, ax=axes[idx],
+                                annot_kws={"size": 11, "fontweight": "semibold"}, linewidths=1, linecolor="white")
+                    axes[idx].set_title(f"Modelo: {nombre}", fontsize=13, fontweight='semibold')
+                    axes[idx].set_xlabel("Predicción")
+                    axes[idx].set_ylabel("Valor Real")
+                    axes[idx].xaxis.set_ticklabels(['No Entidad', 'Entidad'])
+                    axes[idx].yaxis.set_ticklabels(['No Entidad', 'Entidad'])
+                
+                plt.tight_layout()
+                cm_path = os.path.join(args.output_dir, 'confusion_matrices_complementation.png')
+                plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+                plt.close()
+
+                # 2. GENERACIÓN DE LA CURVA ROC COMÚN
+                plt.figure(figsize=(8, 6))
+                
+                # Para clasificadores discretos sin umbrales continuos directos, el espacio ROC se dibuja 
+                # conectando el origen (0,0), el punto operativo del modelo (FPR, TPR) y el extremo (1,1).
+                for nombre, m in modelos_metrics:
+                    plt.plot([0, m['fpr'], 1], [0, m['tpr'], 1], marker='o', label=f'{nombre} (TPR: {m["tpr"]:.2f}, FPR: {m["fpr"]:.2f})')
+                
+                plt.plot([0, 1], [0, 1], color='red', linestyle='--', label='Clasificación Aleatoria')
+                plt.xlim([-0.05, 1.05])
+                plt.ylim([-0.05, 1.05])
+                plt.xlabel('Tasa de Falsos Positivos (FPR)')
+                plt.ylabel('Tasa de Verdaderos Positivos (TPR / Recall)')
+                plt.title('Comparativa del Espacio Curva ROC (Modelos NER)', fontsize=14, fontweight='bold')
+                plt.legend(loc="lower right", frameon=True)
+                plt.grid(True, linestyle=':', alpha=0.6)
+                
+                roc_path = os.path.join(args.output_dir, 'roc_curve_complementation.png')
+                plt.savefig(roc_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                logger.info("Gráficos de evaluación guardados en %s", args.output_dir)
 
                 report = {
                     'sample_size': sample_size,

@@ -4,6 +4,7 @@ Análisis detallado de problemas en el armado de entities
 import json
 import os
 import sys
+from collections import defaultdict
 
 # Configurar UTF-8 para la salida en Windows
 if sys.platform == 'win32':
@@ -11,11 +12,11 @@ if sys.platform == 'win32':
 
 def detailed_entity_analysis():
     """Análisis profundo de los problemas de entities"""
-    json_file = os.path.join('output', 'spacy_augmented_2.json')
+    json_file = os.path.join('output', 'spacy_augmented_6_samp100.json')
     
     with open(json_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
+    #spacy_augmented_6_samp100
     issues = {
         'overlapping': [],          # Entities que se solapan
         'out_of_bounds': [],        # Entities fuera de los límites del texto
@@ -30,7 +31,13 @@ def detailed_entity_analysis():
     valid_labels = {'company', 'address', 'date', 'total'}
     
     print("[*] Análisis detallado de problemas...\n")
-    
+    stats = {
+        'total_examples': len(data),
+        'entity_types': defaultdict(int),
+        'examples_with_entities': 0,
+        'examples_without_entities': 0,
+        'format_issues': []
+    }
     for doc_idx, item in enumerate(data):
         # item es [texto, {"entities": [...]}] en spacy_loaded.json
         if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -45,7 +52,16 @@ def detailed_entity_analysis():
         
         if not entities:
             continue
-        
+        print(f"Doc {doc_idx}: '{text[:50]}...' con {len(entities)} entities")
+        if entities:
+            stats['examples_with_entities'] += 1
+            for ent in entities:
+                if isinstance(ent, dict) and 'label' in ent:
+                    stats['entity_types'][ent['label']] += 1
+                elif isinstance(ent, (list, tuple)) and len(ent) >= 3:
+                    stats['entity_types'][ent[2]] += 1
+        else:
+            stats['examples_without_entities'] += 1
         # Convertir a formato normalizado
         normalized_ents = []
         for ent in entities:
@@ -158,6 +174,13 @@ def detailed_entity_analysis():
     print("=" * 70)
     print("[PROBLEMAS ENCONTRADOS]")
     print("=" * 70)
+    print(f"\n📊 Estadísticas :")
+    print(f"   Total de ejemplos: {stats['total_examples']}")
+    print(f"   Ejemplos con entities: {stats['examples_with_entities']}")
+    print(f"   Ejemplos sin entities: {stats['examples_without_entities']}")
+    print(f"   Tipos de entities encontrados:")
+    for label, count in sorted(stats['entity_types'].items()):
+        print(f"      - {label}: {count}")
     
     if issues['invalid_labels']:
         print(f"\n[ERROR] Labels inválidos encontrados: {issues['invalid_labels']}")

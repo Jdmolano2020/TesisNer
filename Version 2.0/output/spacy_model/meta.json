@@ -17,25 +17,13 @@
     "mode":"default"
   },
   "labels":{
-    "entity_ruler":[
 
-    ],
-    "ner":[
-      "address",
-      "company",
-      "date",
-      "total"
-    ]
   },
   "pipeline":[
-    "entity_ruler",
-    "ner",
-    "sroie_post_process"
+
   ],
   "components":[
-    "entity_ruler",
-    "ner",
-    "sroie_post_process"
+
   ],
   "disabled":[
 

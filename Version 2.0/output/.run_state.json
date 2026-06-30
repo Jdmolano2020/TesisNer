@@ -1,15 +1,15 @@
 {
   "distilbert_data_loaded": true,
-  "distilbert_augmented_2": true,
-  "distilbert_trained": true,
-  "distilbert_metrics_saved": true,
-  "distilbert_plotted": true,
-  "distilbert_model_saved": true,
+  "distilbert_augmented_6": true,
   "spacy_data_loaded": true,
-  "spacy_augmented_3_samp100": true,
+  "spacy_augmented_6_samp100": true,
   "spacy_trained": true,
   "spacy_metrics_saved": true,
   "spacy_plotted": true,
   "spacy_postproc_added": true,
-  "spacy_model_saved": true
+  "spacy_model_saved": true,
+  "distilbert_trained": true,
+  "distilbert_metrics_saved": true,
+  "distilbert_plotted": true,
+  "distilbert_model_saved": true
 }
