@@ -5,7 +5,7 @@ import seaborn as sns
 
 
 def load_metrics(json_path: str) -> dict:
-    """Carga y parsea el archivo JSON de métricas."""
+    """Carga y parsea el archivo JSON de métricas de spaCy."""
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"El archivo no fue encontrado en: {json_path}")
 
@@ -14,22 +14,21 @@ def load_metrics(json_path: str) -> dict:
     return data
 
 
-def plot_training_performance(metrics: dict, output_image_path: str = None):
-    """Genera y guarda gráficos de rendimiento enfocados en Loss y F1-Score."""
-    # 1. Configuración de estilo avanzada con Seaborn (Consistente para ambos modelos)
+def plot_spacy_performance(metrics: dict, output_image_path: str = None):
+    """Genera gráficos de rendimiento para spaCy compatibles con DistilBERT."""
+    # 1. Configuración de estilo idéntica para garantizar comparabilidad
     sns.set_theme(style="whitegrid")
     plt.rcParams.update({"font.size": 11, "axes.labelsize": 12, "axes.titlesize": 14})
 
-    # 2. Extracción y preparación de datos
+    # 2. Extracción de datos específicos de spaCy
     train_loss = metrics.get("train_loss", [])
-    val_loss = metrics.get("val_loss", [])
     val_f1 = metrics.get("val_f1", [])
-    model_type = metrics.get("model_type", "Modelo").upper()
+    model_type = metrics.get("model_type", "spaCy").upper()
     timestamp = metrics.get("timestamp", "")
 
     epochs = range(1, len(train_loss) + 1)
 
-    # 3. Inicializar la figura con dos subgráficos
+    # 3. Inicializar la estructura de subgráficos idéntica (1x2)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     fig.suptitle(
         f"Monitoreo de Entrenamiento - {model_type} ({timestamp})",
@@ -38,7 +37,7 @@ def plot_training_performance(metrics: dict, output_image_path: str = None):
         y=0.98,
     )
 
-    # --- SUBGRÁFICO 1: Pérdidas (Loss) ---
+    # --- SUBGRÁFICO 1: Curva de Pérdida ---
     ax1.plot(
         epochs,
         train_loss,
@@ -46,36 +45,15 @@ def plot_training_performance(metrics: dict, output_image_path: str = None):
         color="#1f77b4",
         linewidth=2.5,
         marker="o",
-        markersize=4,
+        markersize=2,  # Marcadores más pequeños debido a que spaCy tiene 100 épocas
     )
-    if val_loss:
-        ax1.plot(
-            epochs,
-            val_loss,
-            label="Val Loss",
-            color="#d62728",
-            linewidth=2.5,
-            marker="s",
-            markersize=4,
-        )
-
-        # Punto de inflexión del Overfitting
-        min_val_loss_idx = val_loss.index(min(val_loss))
-        ax1.axvline(
-            x=min_val_loss_idx + 1,
-            color="gray",
-            linestyle="--",
-            alpha=0.7,
-            label=f"Mín. Val Loss (Época {min_val_loss_idx+1})",
-        )
-
-    ax1.set_title("Curvas de Pérdida (Loss Summary)", fontweight="semibold")
+    ax1.set_title("Curva de Pérdida (Loss Summary)", fontweight="semibold")
     ax1.set_xlabel("Épocas")
-    ax1.set_ylabel("Pérdida (Loss)")
+    ax1.set_ylabel("Pérdida Absoluta (Loss)")
     ax1.legend(loc="upper right", frameon=True)
     ax1.set_xlim(1, len(train_loss))
 
-    # --- SUBGRÁFICO 2: Validación F1-Score (Enfoque exclusivo) ---
+    # --- SUBGRÁFICO 2: Métrica de Validación (F1-Score) ---
     if val_f1:
         ax2.plot(
             epochs,
@@ -84,10 +62,10 @@ def plot_training_performance(metrics: dict, output_image_path: str = None):
             color="#2ca02c",
             linewidth=2.5,
             marker="v",
-            markersize=4,
+            markersize=2,
         )
 
-        # Identificar visualmente el mejor F1-Score obtenido
+        # Identificar visualmente el mejor F1-Score obtenido en las 100 épocas
         max_f1_idx = val_f1.index(max(val_f1))
         ax2.axvline(
             x=max_f1_idx + 1,
@@ -100,16 +78,16 @@ def plot_training_performance(metrics: dict, output_image_path: str = None):
     ax2.set_title("Métrica de Clasificación (F1-Score)", fontweight="semibold")
     ax2.set_xlabel("Épocas")
     ax2.set_ylabel("Score (0.0 - 1.0)")
-    ax2.set_ylim(0.5, 1.05)  # Escala estricta para comparación directa
+    ax2.set_ylim(0.5, 1.05)  # Rango idéntico al de DistilBERT para una comparación justa
     ax2.legend(loc="lower right", frameon=True)
     ax2.set_xlim(1, len(train_loss))
 
     plt.tight_layout()
 
-    # 4. Guardar o Mostrar el gráfico
+    # 4. Guardar o Mostrar el gráfico resultante
     if output_image_path:
         plt.savefig(output_image_path, dpi=300, bbox_inches="tight")
-        print(f"[INFO] Gráfico de DistilBERT guardado en: {output_image_path}")
+        print(f"[INFO] Gráfico de spaCy guardado en: {output_image_path}")
     else:
         plt.show()
 
@@ -118,16 +96,24 @@ if __name__ == "__main__":
     BASE_DIR = r"C:\Users\HP\Documents\Tesis\Programas\Ner\TesisNer\Version 2.0"
     OUTPUT_SUBDIR = os.path.join(BASE_DIR, "output")
 
-    FILE_NAME = "metrics_20260628_163720.json"
-    IMAGE_NAME = "reporte_performance_distilbert.png"
+    # Archivo de destino solicitado para spaCy
+    FILE_NAME = "metrics_20260525_194453.json"
+    IMAGE_NAME = "reporte_performance_spacy.png"
 
     JSON_FILE = os.path.join(OUTPUT_SUBDIR, FILE_NAME)
     OUTPUT_IMAGE = os.path.join(OUTPUT_SUBDIR, IMAGE_NAME)
 
     try:
+        print(f"[PROCESO] Buscando datos de spaCy en: {JSON_FILE}")
         raw_metrics = load_metrics(JSON_FILE)
-        plot_training_performance(raw_metrics, output_image_path=OUTPUT_IMAGE)
+
+        print(f"[PROCESO] Generando gráficos comparables...")
+        plot_spacy_performance(raw_metrics, output_image_path=OUTPUT_IMAGE)
+
     except FileNotFoundError as fnf_error:
         print(f"[ERROR DE RUTA] {fnf_error}")
+        print(
+            "[CONSEJO] Verifica que el JSON de spaCy esté en la carpeta 'output'."
+        )
     except Exception as e:
-        print(f"[ERROR] Ocurrió un fallo inesperado: {e}")
+        print(f"[ERROR] Ocurrió un fallo inesperado en la ejecución: {e}")

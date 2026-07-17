@@ -8,8 +8,11 @@
   "spacy_plotted": true,
   "spacy_postproc_added": true,
   "spacy_model_saved": true,
+  "spacy_augmented_0_samp100": true,
+  "distilbert_augmented_1": true,
   "distilbert_trained": true,
   "distilbert_metrics_saved": true,
   "distilbert_plotted": true,
-  "distilbert_model_saved": true
+  "distilbert_model_saved": true,
+  "spacy_augmented_1_samp100": true
 }

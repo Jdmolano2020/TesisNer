@@ -3,7 +3,7 @@
     "output_dir": "./output",
     "model_type": "both",
     "technique": "combined",
-    "num_augmentations": 6,
+    "num_augmentations": 1,
     "spacy_sample_pct": 100,
     "batch_size": 8,
     "n_iter": 100,
